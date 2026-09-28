@@ -68,6 +68,12 @@ enum Commands {
     /// `.zylcode/releases/`, registered in the Artifact Bus.
     Package(PackageArgs),
 
+    /// Run the First Mission: an end-to-end evidence-first engineering run
+    /// (specification → plan → real tools → real failure → repair →
+    /// interruption/resume → engineering record → reproducibility package).
+    /// Resumes automatically when mission state already exists in --workdir.
+    Mission(MissionArgs),
+
     /// Delivery: report deploy targets that are actually commissioned
     /// (GitHub release via tag, crates.io token, remote server).
     DeployStatus,
@@ -481,6 +487,7 @@ async fn main() -> Result<()> {
         Commands::ServeIntel(args) => handle_serve_intel(&cli.workspace, args).await,
         Commands::BestOfN(args) => handle_best_of_n(&cli.workspace, args).await,
         Commands::Package(args) => handle_package(&cli.workspace, args).await,
+        Commands::Mission(args) => handle_mission(args).await,
         Commands::DeployStatus => {
             let payload = zylcode_core::delivery::deploy_targets(Path::new(&cli.workspace))?;
             println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1576,6 +1583,101 @@ async fn handle_best_of_n(workspace: &str, args: BestOfNArgs) -> Result<()> {
         None => {
             eprintln!("no candidate passed verification");
             std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mission: the First Mission end-to-end runner (§36)
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+struct MissionArgs {
+    /// Human specification document (markdown prose + fenced ```json block).
+    #[arg(long)]
+    spec: std::path::PathBuf,
+
+    /// Fixture project directory copied into the mission workspace.
+    #[arg(long)]
+    fixture: std::path::PathBuf,
+
+    /// Mission workspace (holds `project/` and `.zylcode/` mission state).
+    /// Existing mission state is resumed; nothing else is adopted.
+    #[arg(long)]
+    workdir: std::path::PathBuf,
+
+    /// Refuse to start when mission state already exists.
+    #[arg(long, default_value_t = false)]
+    fresh: bool,
+
+    /// Harness interruption point for crash/resume tests (e.g.
+    /// `op:2:pre-evidence`). Falls back to $ZYLCODE_MISSION_CRASH_AT.
+    #[arg(long)]
+    crash_at: Option<String>,
+}
+
+/// Run (or resume) a First Mission and print the closing statement (§35).
+/// Exit codes: 0 = completed with evidence, 2 = blocked (reason on stderr),
+/// 1 = the runner itself failed, non-zero abort = injected interruption.
+async fn handle_mission(args: MissionArgs) -> Result<()> {
+    let crash_at = args.crash_at.or_else(|| {
+        std::env::var("ZYLCODE_MISSION_CRASH_AT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    });
+    let cfg = zylcode_core::first_mission::MissionRunConfig {
+        spec_path: args.spec,
+        fixture_path: args.fixture,
+        workdir: args.workdir,
+        fresh: args.fresh,
+        crash_at,
+    };
+    let outcome = zylcode_core::first_mission::run_first_mission(cfg).await?;
+
+    println!("mission: {}", outcome.mission_id);
+    println!("proven: {}", outcome.verified_claims.len());
+    for c in &outcome.verified_claims {
+        println!("  [proven] {c}");
+    }
+    println!("observed: {}", outcome.observed_claims.len());
+    println!("derived: {}", outcome.derived_claims.len());
+    for c in &outcome.derived_claims {
+        println!("  [derived] {c}");
+    }
+    println!("hypotheses: {}", outcome.hypotheses.len());
+    for c in &outcome.hypotheses {
+        println!("  [hypothesis] {c}");
+    }
+    println!("unknowns: {}", outcome.unknowns.len());
+    for c in &outcome.unknowns {
+        println!("  [unknown] {c}");
+    }
+    println!("failures: {}", outcome.failure_count);
+    println!(
+        "interruptions survived: {} (reconciled steps: {})",
+        outcome.resumed_count, outcome.reconciled_steps
+    );
+    println!(
+        "integrity: ledger={} graph={} claims={}",
+        outcome.integrity.ledger_chain, outcome.integrity.graph, outcome.integrity.claims_chain
+    );
+    println!("record: {}", outcome.record_path.display());
+    println!("package: {}", outcome.package_path.display());
+
+    match outcome.status {
+        zylcode_core::first_mission::MissionOutcomeStatus::Completed => {
+            println!("status: COMPLETED");
+            Ok(())
+        }
+        zylcode_core::first_mission::MissionOutcomeStatus::Blocked => {
+            eprintln!(
+                "status: BLOCKED — {}",
+                outcome
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or("no reason recorded")
+            );
+            std::process::exit(2);
         }
     }
 }
