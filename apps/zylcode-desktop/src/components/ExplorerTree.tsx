@@ -45,9 +45,22 @@ function sortChildren(map: Map<string, TreeNode>): TreeNode[] {
 }
 
 /**
+ * How often the Explorer re-probes while the tree service is unavailable.
+ * Exported so regression tests assert against the real value.
+ */
+export const TREE_RETRY_MS = 15000;
+
+/**
  * Live Explorer: the scanner's actual file tree (gitignore-aware), nested
  * client-side from the flat real rows. Directories collapse; files open in
  * the central editor. No fake "sample project" entries.
+ *
+ * Backend-recovery contract (same defect class the Terminal had): if the
+ * intelligence backend starts *after* this surface mounts, the one-shot
+ * fetch used to latch BLOCKED forever. While unavailable, the tree now
+ * re-probes every TREE_RETRY_MS and recovers to AVAILABLE without a page
+ * reload; healthy states never re-fetch, so the loop is a no-op when
+ * connected. Failed probes never fabricate data — BLOCKED stays honest.
  */
 export function ExplorerTree({ onOpenFile, activePath, compact }: ExplorerTreeProps) {
   const [state, setState] = useState<
@@ -57,11 +70,20 @@ export function ExplorerTree({ onOpenFile, activePath, compact }: ExplorerTreePr
 
   useEffect(() => {
     let cancelled = false;
-    fetchFileTree().then((next) => {
-      if (!cancelled && next.kind !== "loading") setState(next);
-    });
+    const load = () =>
+      fetchFileTree().then((next) => {
+        if (!cancelled && next.kind !== "loading") setState(next);
+      });
+    void load();
+    const t = setInterval(() => {
+      setState((prev) => {
+        if (prev.kind === "unavailable") void load();
+        return prev;
+      });
+    }, TREE_RETRY_MS);
     return () => {
       cancelled = true;
+      clearInterval(t);
     };
   }, []);
 

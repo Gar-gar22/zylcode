@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { IS_DESKTOP, ENVIRONMENT } from "./events";
-import { safeInvoke } from "./runtime";
+import { safeInvoke, recordDiagnostic } from "./runtime";
 import type { StreamDelta } from "./events";
 
 export interface ArtifactFile {
@@ -18,6 +18,48 @@ const CDATA_CLOSE = "]]>";
 const CONTENT_TAG_OPEN = "<content";
 const CONTENT_TAG_CLOSE = "</content>";
 const FENCE_OPEN = "```";
+
+/** Result shape shared by both transports of [[callArtifactBackend]]. */
+type BackendResult<T> = { ok: true; data: T } | { ok: false; reason: string };
+
+/**
+ * Transport parity for the editor write path (the pattern established by
+ * lib/fileContent.ts): the desktop runtime invokes the Tauri command; the
+ * browser preview POSTs to the equivalent /api endpoint through the Vite
+ * proxy. Both transports land on the same validated backend payload
+ * functions, so containment and patch rules are identical everywhere.
+ */
+async function callArtifactBackend<T>(
+  cmd: "save_workspace_artifact" | "apply_patch",
+  args: Record<string, unknown>,
+): Promise<BackendResult<T>> {
+  if (IS_DESKTOP) {
+    return safeInvoke<T>(ENVIRONMENT, cmd, args);
+  }
+  const url =
+    cmd === "save_workspace_artifact" ? "/api/artifact/save" : "/api/artifact/patch";
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(args),
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        reason: `artifact service returned HTTP ${response.status}`,
+      };
+    }
+    const data = (await response.json()) as Record<string, unknown>;
+    if (data && typeof data === "object" && "error" in data && data.error) {
+      return { ok: false, reason: String(data.error) };
+    }
+    return { ok: true, data: data as T };
+  } catch (e) {
+    recordDiagnostic(`artifact.${cmd}`, String(e));
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+  }
+}
 
 function detectLanguage(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -177,7 +219,7 @@ export function useArtifactStream(deltas: StreamDelta[]) {
     if (!file) return;
     setSaveStatus((s) => ({ ...s, [path]: "saving" }));
     try {
-      const res = await safeInvoke(ENVIRONMENT, "save_workspace_artifact", {
+      const res = await callArtifactBackend("save_workspace_artifact", {
         label: path,
         content: file.fullContent,
       });
@@ -199,7 +241,7 @@ export function useArtifactStream(deltas: StreamDelta[]) {
     if (!file) return;
     setSaveStatus((s) => ({ ...s, [path]: "saving" }));
     try {
-      const res = await safeInvoke(ENVIRONMENT, "apply_patch", {
+      const res = await callArtifactBackend("apply_patch", {
         patch: file.fullContent,
       });
       if (!res.ok) {

@@ -237,6 +237,191 @@ pub fn file_content_payload(root: &Path, rel_path: &str) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Editor write path (G-03): save + apply-patch backends
+// ---------------------------------------------------------------------------
+
+/// Write edited editor content back into the workspace (the desktop editor's
+/// save command backend).
+///
+/// Same containment rules as [`file_content_payload`] plus write-specific
+/// hardening:
+/// - refuses `.git/*`, absolute paths and `..` *before* touching the fs;
+/// - resolves the parent directory (which must exist) and re-checks
+///   containment, so the final target path is canonical;
+/// - never writes *through* a symlink that resolves outside the workspace;
+/// - refuses payloads above [`MAX_FILE_BYTES`] instead of truncating.
+pub fn save_file_payload(root: &Path, rel_path: &str, content: &str) -> Result<Value> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "repository root '{}' is not a directory",
+        root.display()
+    );
+    anyhow::ensure!(!rel_path.trim().is_empty(), "file path must not be empty");
+    anyhow::ensure!(
+        content.len() <= MAX_FILE_BYTES as usize,
+        "content is {} bytes; the editor refuses writes above {} bytes",
+        content.len(),
+        MAX_FILE_BYTES
+    );
+    let rel = std::path::Path::new(rel_path);
+    anyhow::ensure!(
+        !rel.is_absolute(),
+        "file path must be relative to the workspace"
+    );
+    anyhow::ensure!(
+        !rel.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "file path must not contain '..'"
+    );
+    let normalized = rel_path.replace('\\', "/");
+    anyhow::ensure!(
+        !normalized.starts_with(".git/"),
+        "'.git/*' paths are not writable from the editor"
+    );
+
+    let canon_root = root.canonicalize()?;
+    let dest = root.join(rel);
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path '{}' has no parent directory", rel_path))?;
+    let canon_parent = parent.canonicalize()?;
+    anyhow::ensure!(
+        canon_parent.starts_with(&canon_root),
+        "file path escapes the workspace"
+    );
+    let name = dest
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path '{}' has no file name", rel_path))?;
+    let mut target = canon_parent.join(name);
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            // resolve (errors honestly on a dangling link), then re-check
+            target = target.canonicalize()?;
+            anyhow::ensure!(
+                target.starts_with(&canon_root),
+                "file path escapes the workspace"
+            );
+        } else {
+            anyhow::ensure!(ft.is_file(), "'{}' is not a regular file", rel_path);
+        }
+    }
+    std::fs::write(&target, content)?;
+    let written = std::fs::metadata(&target)?.len();
+    Ok(json!({
+        "path": normalized,
+        "size": written,
+        "lines": content.lines().count(),
+        "bytes": content.len(),
+    }))
+}
+
+/// Apply a unified diff (the artifact stream's Ctrl+Enter patch) with
+/// `git apply` in the workspace root.
+///
+/// Every target path is validated *before* git runs: git 2.45 silently
+/// rewrites absolute and `../` headers to workspace-relative paths and
+/// refuses `.git/` targets itself (all three verified empirically), so
+/// ZylCode refuses them up front instead of depending on version-specific
+/// git behaviour. The patch is materialised in a temp file *outside* the
+/// workspace and applied with `git apply`, which fails closed on any
+/// malformed hunk and reports the real stderr — no fuzzy patching, no
+/// partial success.
+///
+/// Line endings are **byte-faithful** (`-c core.autocrlf=false`, verified
+/// against git 2.45): an LF file + LF patch stays LF, a CRLF file + CRLF
+/// patch stays CRLF, and a cross-EOL patch is refused with git's real
+/// error instead of being "fixed" — the default autocrlf path on Windows
+/// would otherwise rewrite every untouched line of an LF file to CRLF, and
+/// `--ignore-whitespace` leaves mixed-EOL corruption behind. The user's git
+/// config can never silently rewrite content the patch did not touch.
+pub fn apply_patch_payload(root: &Path, patch: &str) -> Result<Value> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "repository root '{}' is not a directory",
+        root.display()
+    );
+    anyhow::ensure!(!patch.trim().is_empty(), "patch is empty");
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut new_paths: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let header = if let Some(rest) = line.strip_prefix("+++ ") {
+            Some((rest, true))
+        } else {
+            line.strip_prefix("--- ").map(|rest| (rest, false))
+        };
+        let Some((rest, is_new)) = header else {
+            continue;
+        };
+        // strip an optional tab-separated timestamp, then the a/ b/ prefix
+        let raw = rest.split('\t').next().unwrap_or("").trim();
+        if raw.is_empty() || raw == "/dev/null" {
+            continue;
+        }
+        let path = raw
+            .strip_prefix("a/")
+            .or_else(|| raw.strip_prefix("b/"))
+            .unwrap_or(raw);
+        let p = std::path::Path::new(path);
+        anyhow::ensure!(
+            !p.is_absolute() && !path.starts_with('/'),
+            "patch targets an absolute path: {path}"
+        );
+        anyhow::ensure!(
+            !p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "patch escapes the workspace: {path}"
+        );
+        let normalized = path.replace('\\', "/");
+        anyhow::ensure!(
+            !normalized.starts_with(".git/"),
+            "patch touches .git/*: refused"
+        );
+        paths.push(normalized.clone());
+        if is_new {
+            new_paths.push(normalized);
+        }
+    }
+    anyhow::ensure!(!paths.is_empty(), "patch names no files");
+    // report post-image names; pure deletions have only pre-image names
+    let targets = if new_paths.is_empty() {
+        paths
+    } else {
+        new_paths
+    };
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp =
+        std::env::temp_dir().join(format!("zylcode-patch-{}-{stamp}.diff", std::process::id()));
+    std::fs::write(&tmp, patch)?;
+    let out = std::process::Command::new("git")
+        .arg("-c")
+        .arg("core.autocrlf=false")
+        .arg("apply")
+        .arg("--whitespace=nowarn")
+        .arg("--recount")
+        .arg(&tmp)
+        .current_dir(root)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    let out = out.map_err(|e| anyhow::anyhow!("git apply could not start: {e}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(json!({
+        "applied": true,
+        "files": targets,
+        "bytes": patch.len(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Evidence ledger
 // ---------------------------------------------------------------------------
 
@@ -664,5 +849,199 @@ mod tests {
         let payload = file_content_payload(&root, "blob.bin").unwrap();
         assert_eq!(payload["lossy"], true, "{payload:?}");
         assert!(payload["content"].as_str().unwrap().contains("hi"));
+    }
+}
+
+#[cfg(test)]
+mod editor_write_tests {
+    use super::*;
+
+    /// A plain directory — deliberately *not* a git repository: `git apply`
+    /// must work on any workspace the editor can open (verified empirically).
+    fn workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("target.txt"), "line1\nline2\nline3\n").unwrap();
+        (dir, root)
+    }
+
+    fn patch_for(new_line: &str) -> String {
+        format!(
+            "--- a/target.txt\n+++ b/target.txt\n@@ -1,3 +1,3 @@\n line1\n-line2\n+{new_line}\n line3\n"
+        )
+    }
+
+    #[test]
+    fn save_writes_existing_file_inside_workspace() {
+        let (_dir, root) = workspace();
+        let payload = save_file_payload(&root, "target.txt", "edited\n").unwrap();
+        assert_eq!(payload["path"], "target.txt");
+        assert_eq!(payload["bytes"], 7);
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "edited\n"
+        );
+    }
+
+    #[test]
+    fn save_creates_new_file_in_existing_directory() {
+        let (_dir, root) = workspace();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        save_file_payload(&root, "sub/new.txt", "hello").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/new.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn save_refuses_escape_git_and_absolute_paths() {
+        let (_dir, root) = workspace();
+        for bad in [
+            "../evil.txt",
+            "sub/../../evil.txt",
+            "C:/Windows/win.ini",
+            "/etc/hosts",
+            ".git/hooks/planted",
+            "",
+        ] {
+            assert!(
+                save_file_payload(&root, bad, "x").is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+        // nothing outside or hidden was written
+        assert!(!root.parent().unwrap().join("evil.txt").exists());
+        assert!(!root.join(".git").exists());
+    }
+
+    #[test]
+    fn save_refuses_directory_target_and_oversize_payload() {
+        let (_dir, root) = workspace();
+        std::fs::create_dir(root.join("adir")).unwrap();
+        assert!(save_file_payload(&root, "adir", "x").is_err());
+        let big = "a".repeat(MAX_FILE_BYTES as usize + 1);
+        assert!(save_file_payload(&root, "target.txt", &big).is_err());
+        // refused write left the original untouched
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "line1\nline2\nline3\n"
+        );
+    }
+
+    #[test]
+    fn save_refuses_symlink_resolving_outside() {
+        let (_dir, root) = workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "original").unwrap();
+        let link = root.join("link.txt");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&victim, &link).is_err() {
+            eprintln!("skip: symlink creation not permitted on this host");
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let err = save_file_payload(&root, "link.txt", "PWNED").unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "outside file must be untouched"
+        );
+    }
+
+    #[test]
+    fn patch_applies_real_unified_diff_outside_a_git_repo() {
+        let (_dir, root) = workspace();
+        let payload = apply_patch_payload(&root, &patch_for("line2-EDITED")).unwrap();
+        assert_eq!(payload["applied"], true);
+        assert_eq!(payload["files"][0], "target.txt");
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "line1\nline2-EDITED\nline3\n"
+        );
+    }
+
+    #[test]
+    fn patch_refuses_escaping_headers_before_git_runs() {
+        let (_dir, root) = workspace();
+        for (header, needle) in [
+            ("+++ /etc/hosts", "absolute path"),
+            ("+++ b/../evil.txt", "escapes the workspace"),
+            ("+++ .git/hooks/planted", ".git/*"),
+        ] {
+            let patch = format!("--- /dev/null\n{header}\n@@ -0,0 +1 @@\n+x\n");
+            let err = apply_patch_payload(&root, &patch).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} for {header}, got: {err}"
+            );
+        }
+        assert!(!root.join("evil.txt").exists());
+        assert!(!root.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "line1\nline2\nline3\n",
+            "target unchanged — refusal happened before git ran"
+        );
+    }
+
+    #[test]
+    fn patch_malformed_fails_closed_without_touching_the_file() {
+        let (_dir, root) = workspace();
+        // context mismatch: git apply must reject the whole patch
+        let broken =
+            "--- a/target.txt\n+++ b/target.txt\n@@ -1,3 +1,3 @@\n line1\n WRONG\n line3\n";
+        let err = apply_patch_payload(&root, broken).unwrap_err();
+        assert!(err.to_string().contains("git apply failed"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "line1\nline2\nline3\n",
+            "file untouched after failed apply"
+        );
+        // not a unified diff at all
+        assert!(apply_patch_payload(&root, "just some text").is_err());
+        assert!(apply_patch_payload(&root, "   ").is_err());
+    }
+
+    #[test]
+    fn patch_line_endings_are_byte_faithful_and_fail_closed() {
+        let (_dir, root) = workspace();
+
+        // 1. LF file + LF patch → applied, still LF (this host has
+        //    core.autocrlf=true globally; the invocation must override it).
+        apply_patch_payload(&root, &patch_for("lf-edit")).unwrap();
+        let bytes = std::fs::read(root.join("target.txt")).unwrap();
+        assert!(
+            !bytes.contains(&b'\r'),
+            "untouched LF lines must not be rewritten to CRLF: {bytes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "line1\nlf-edit\nline3\n"
+        );
+
+        // 2. CRLF file + CRLF patch → applied, still uniformly CRLF.
+        std::fs::write(root.join("target.txt"), "line1\r\nline2\r\nline3\r\n").unwrap();
+        let crlf_patch = patch_for("crlf-edit").replace('\n', "\r\n");
+        apply_patch_payload(&root, &crlf_patch).unwrap();
+        let bytes = std::fs::read(root.join("target.txt")).unwrap();
+        assert_eq!(
+            bytes,
+            b"line1\r\ncrlf-edit\r\nline3\r\n".to_vec(),
+            "CRLF file + CRLF patch stays uniformly CRLF"
+        );
+
+        // 3. CRLF file + LF patch → refused honestly, no mixed-EOL damage.
+        std::fs::write(root.join("target.txt"), "line1\r\nline2\r\nline3\r\n").unwrap();
+        let err = apply_patch_payload(&root, &patch_for("x")).unwrap_err();
+        assert!(err.to_string().contains("git apply failed"), "{err}");
+        assert_eq!(
+            std::fs::read(root.join("target.txt")).unwrap(),
+            b"line1\r\nline2\r\nline3\r\n".to_vec(),
+            "refused patch left the CRLF file untouched"
+        );
     }
 }

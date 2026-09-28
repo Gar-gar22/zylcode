@@ -26,9 +26,21 @@ export interface TerminalOutput {
   stderrTail: string;
   truncated: boolean;
   durationMs: number;
+  /**
+   * True when the *transport* failed (backend unreachable / HTTP error),
+   * as opposed to the executed command merely failing. UI surfaces use this
+   * to distinguish "the shell reported an error" from "the terminal service
+   * is unavailable" — string-prefix sniffing of stderrTail was the previous
+   * (fragile) mechanism and could not drive automatic recovery.
+   */
+  transportError: boolean;
 }
 
-function failed(question: string, detail: string): TerminalOutput {
+function failed(
+  question: string,
+  detail: string,
+  transport = true,
+): TerminalOutput {
   return {
     sessionId: "",
     cwd: "",
@@ -38,6 +50,7 @@ function failed(question: string, detail: string): TerminalOutput {
     stderrTail: `${question}: ${detail}`,
     truncated: false,
     durationMs: 0,
+    transportError: transport,
   };
 }
 
@@ -55,7 +68,8 @@ function toSnake(req: TerminalRequest): Record<string, unknown> {
 
 export async function terminalExec(req: TerminalRequest): Promise<TerminalOutput> {
   if (!req.command.trim()) {
-    return failed("terminal exec rejected", "command must not be empty");
+    // validation failure, not a transport failure — must not flip health
+    return failed("terminal exec rejected", "command must not be empty", false);
   }
   try {
     if (isDesktop()) {
@@ -98,6 +112,7 @@ function normalize(raw: Record<string, unknown>): TerminalOutput {
     stderrTail: String(raw.stderrTail ?? raw.stderr_tail ?? ""),
     truncated: Boolean(raw.truncated ?? false),
     durationMs: Number(raw.durationMs ?? raw.duration_ms ?? 0),
+    transportError: false,
   };
 }
 

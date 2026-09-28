@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Panel } from "./Panel";
 import { StatusBadge, type CapabilityStatus } from "./CapabilityStatus";
 import {
   terminalExec,
@@ -10,11 +9,26 @@ import {
 const BRAND_BG = "#141414"; // the logo's own dark chip color
 
 /**
+ * How often to re-probe the terminal service while it reports BLOCKED.
+ * Kept short enough to feel automatic, long enough to not hammer a dead
+ * backend. Exported so regression tests assert against the real value.
+ */
+export const RECOVERY_INTERVAL_MS = 2000;
+
+/**
  * Real terminal surface: keystrokes go to a persistent backend session
  * (zylcode serve-intel HTTP route, or the Tauri terminal_exec command),
  * output comes back from actually executed commands, and the working
- * directory persists across them. xterm.js is imported lazily so tests
- * never touch browser-only APIs.
+ * directory persists across them.
+ *
+ * Health contract (regression-tested):
+ * - backend down at mount → BLOCKED truthfully, then re-probe every
+ *   RECOVERY_INTERVAL_MS and recover to AVAILABLE automatically when the
+ *   backend returns — no page reload required;
+ * - backend dies mid-session → the next command's transport failure flips
+ *   the badge back to BLOCKED and re-arms the same recovery loop;
+ * - a command that merely *fails* (non-zero exit) never changes health;
+ * - a failed session reset reports failure instead of claiming reset.
  */
 export const TerminalPanel: React.FC = () => {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -27,12 +41,63 @@ export const TerminalPanel: React.FC = () => {
   const [statusNote, setStatusNote] = useState("connecting to terminal service…");
   const [ready, setReady] = useState(false);
 
+  // Refs used inside the xterm data handler and the recovery timer without
+  // re-binding either (first-render closures stay correct via refs).
+  const readyRef = useRef(false);
+  const lineRef = useRef("");
+  const historyRef = useRef<string[]>([]);
+  const histIdxRef = useRef<number | undefined>(undefined);
+  const statusRef = useRef<CapabilityStatus>("BLOCKED");
+  const recoverTimerRef = useRef<number | null>(null);
+
   const writePrompt = useCallback(() => {
     const term = termRef.current;
     if (!term) return;
     const dir = cwdRef.current ? cwdRef.current.split(/[\\/]/).pop() || cwdRef.current : "zylcode";
     term.write(`\r\n\u001b[36m${dir}\u001b[0m \u001b[32m$\u001b[0m `);
   }, []);
+
+  const setStatusBoth = useCallback(
+    (next: CapabilityStatus, note: string) => {
+      statusRef.current = next;
+      setStatus(next);
+      setStatusNote(note);
+    },
+    [],
+  );
+
+  const stopRecovery = useCallback(() => {
+    if (recoverTimerRef.current !== null) {
+      window.clearInterval(recoverTimerRef.current);
+      recoverTimerRef.current = null;
+    }
+  }, []);
+
+  /**
+   * Quietly re-probe the service until it answers. On success: adopt the
+   * (re)created session, flip the badge to AVAILABLE, tell the user in the
+   * terminal itself, and stop the timer. Failed probes change nothing —
+   * BLOCKED stays until the backend is genuinely back.
+   */
+  const armRecovery = useCallback(() => {
+    if (recoverTimerRef.current !== null) return;
+    recoverTimerRef.current = window.setInterval(async () => {
+      const probe = await terminalExec({
+        sessionId: sessionRef.current,
+        cwd: null,
+        command: "echo zylcode_terminal_ready",
+      });
+      if (probe.transportError) return; // still down — stay BLOCKED
+      stopRecovery();
+      if (probe.sessionId) sessionRef.current = probe.sessionId;
+      if (probe.cwd) cwdRef.current = probe.cwd;
+      setStatusBoth("AVAILABLE", "real shell · cwd persists per session");
+      termRef.current?.write(
+        "\r\n\u001b[32m— terminal service recovered —\u001b[0m",
+      );
+      writePrompt();
+    }, RECOVERY_INTERVAL_MS);
+  }, [setStatusBoth, stopRecovery, writePrompt]);
 
   const runCommand = useCallback(
     async (line: string) => {
@@ -44,6 +109,22 @@ export const TerminalPanel: React.FC = () => {
         cwd: cwdRef.current || null,
         command: line,
       });
+      if (out.transportError) {
+        // The service is gone, not the command: report BLOCKED truthfully
+        // and re-arm the recovery loop.
+        setStatusBoth("BLOCKED", out.stderrTail);
+        term.write(`\r\n\u001b[31m${out.stderrTail.replace(/\n/g, "\r\n")}\u001b[0m`);
+        busyRef.current = false;
+        writePrompt();
+        armRecovery();
+        return;
+      }
+      if (statusRef.current === "BLOCKED") {
+        // A command got through while the badge said BLOCKED (e.g. the
+        // user typed before the recovery probe fired): trust the evidence.
+        stopRecovery();
+        setStatusBoth("AVAILABLE", "real shell · cwd persists per session");
+      }
       if (out.sessionId) sessionRef.current = out.sessionId;
       if (out.cwd) cwdRef.current = out.cwd;
       if (out.stdoutTail) {
@@ -61,7 +142,7 @@ export const TerminalPanel: React.FC = () => {
       busyRef.current = false;
       writePrompt();
     },
-    [writePrompt],
+    [armRecovery, setStatusBoth, stopRecovery, writePrompt],
   );
 
   useEffect(() => {
@@ -94,7 +175,7 @@ export const TerminalPanel: React.FC = () => {
         termRef.current = term;
         fitRef.current = fit;
 
-        term.onData((data) => {
+        term.onData((data: string) => {
           if (!readyRef.current) return;
           if (data === "\r") {
             if (busyRef.current) return;
@@ -121,20 +202,19 @@ export const TerminalPanel: React.FC = () => {
 
         // Probe the service so the badge tells the truth before typing.
         const probe = await terminalExec({
-          sessionId: null,
+          sessionId: sessionRef.current,
           cwd: null,
           command: "echo zylcode_terminal_ready",
         });
         if (disposed) return;
-        if (probe.stderrTail.startsWith("terminal ")) {
-          setStatus("BLOCKED");
-          setStatusNote(probe.stderrTail);
-          term.write(`\r\n\u001b[31m${probe.stderrTail}\u001b[0m`);
+        if (probe.transportError) {
+          setStatusBoth("BLOCKED", probe.stderrTail);
+          term.write(`\r\n\u001b[31m${probe.stderrTail.replace(/\n/g, "\r\n")}\u001b[0m`);
+          armRecovery();
         } else {
-          sessionRef.current = probe.sessionId;
-          cwdRef.current = probe.cwd;
-          setStatus("AVAILABLE");
-          setStatusNote("real shell · cwd persists per session");
+          if (probe.sessionId) sessionRef.current = probe.sessionId;
+          if (probe.cwd) cwdRef.current = probe.cwd;
+          setStatusBoth("AVAILABLE", "real shell · cwd persists per session");
           term.write("\u001b[90mZylCode terminal — commands run for real.\u001b[0m");
           writePrompt();
         }
@@ -149,24 +229,17 @@ export const TerminalPanel: React.FC = () => {
         };
       } catch (err) {
         if (!disposed) {
-          setStatus("BLOCKED");
-          setStatusNote(`terminal UI failed to load: ${String(err)}`);
+          setStatusBoth("BLOCKED", `terminal UI failed to load: ${String(err)}`);
         }
       }
     })();
 
     return () => {
       disposed = true;
+      stopRecovery();
       cleanup?.();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Refs used inside the xterm data handler without re-binding it.
-  const readyRef = useRef(false);
-  const lineRef = useRef("");
-  const historyRef = useRef<string[]>([]);
-  const histIdxRef = useRef<number | undefined>(undefined);
+  }, [armRecovery, runCommand, setStatusBoth, stopRecovery, writePrompt]);
 
   const handleClear = useCallback(() => {
     termRef.current?.clear();
@@ -174,13 +247,21 @@ export const TerminalPanel: React.FC = () => {
   }, [writePrompt]);
 
   const handleReset = useCallback(async () => {
-    await terminalReset();
+    const ok = await terminalReset();
+    const term = termRef.current;
+    if (!ok) {
+      // Never claim a reset happened when the service never received it.
+      term?.writeln("\u001b[31m— reset failed: terminal service unavailable —\u001b[0m");
+      setStatusBoth("BLOCKED", "terminal service unavailable — session not reset");
+      armRecovery();
+      return;
+    }
     sessionRef.current = null;
     cwdRef.current = "";
-    termRef.current?.writeln("");
-    termRef.current?.writeln("\u001b[90m— session reset —\u001b[0m");
+    term?.writeln("");
+    term?.writeln("\u001b[90m— session reset —\u001b[0m");
     writePrompt();
-  }, [writePrompt]);
+  }, [armRecovery, setStatusBoth, writePrompt]);
 
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">

@@ -412,11 +412,24 @@ function EvidenceView() {
   const [evidence, setEvidence] = useState<EvidenceState | null>(null);
   useEffect(() => {
     let cancelled = false;
-    fetchEvidence().then((next) => {
-      if (!cancelled) setEvidence(next);
-    });
+    const pull = () => {
+      fetchEvidence().then((next) => {
+        if (!cancelled) setEvidence(next);
+      });
+    };
+    pull();
+    // Recovery loop (same defect class as the Terminal latch): re-probe
+    // while the ledger service is unavailable so a backend that starts
+    // later is picked up without a reload; no polling once data flows.
+    const t = setInterval(() => {
+      setEvidence((prev) => {
+        if (prev && prev.kind === "unavailable") void pull();
+        return prev;
+      });
+    }, 6000);
     return () => {
       cancelled = true;
+      clearInterval(t);
     };
   }, []);
   if (!evidence || evidence.kind === "loading")

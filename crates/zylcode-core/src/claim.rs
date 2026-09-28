@@ -214,7 +214,10 @@ impl Claim {
 
     /// Attach an evidence reference (idempotent).
     pub fn add_evidence(&mut self, kind: EvidenceKind, id: impl Into<String>) {
-        let r = EvidenceRef { kind, id: id.into() };
+        let r = EvidenceRef {
+            kind,
+            id: id.into(),
+        };
         if !self.evidence_refs.contains(&r) {
             self.evidence_refs.push(r);
         }
@@ -336,7 +339,12 @@ impl Claim {
         h.update(self.confidence.to_le_bytes());
         h.update(serde_json::to_string(&self.verification_level).unwrap_or_default());
         h.update(self.created_at.to_rfc3339().as_bytes());
-        h.update(self.verified_at.map(|t| t.to_rfc3339()).unwrap_or_default().as_bytes());
+        h.update(
+            self.verified_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         h.update(self.note.clone().unwrap_or_default().as_bytes());
         h.update(self.mission_id.clone().unwrap_or_default().as_bytes());
         h.update(self.prev_hash.as_bytes());
@@ -584,7 +592,10 @@ mod tests {
         let raw = std::fs::read_to_string(store.path()).unwrap();
         let tampered = raw.replace("Rust compilation succeeded", "Everything is fine");
         std::fs::write(store.path(), tampered).unwrap();
-        assert!(!store.verify_chain().unwrap(), "tampered chain must not verify");
+        assert!(
+            !store.verify_chain().unwrap(),
+            "tampered chain must not verify"
+        );
     }
 
     #[test]

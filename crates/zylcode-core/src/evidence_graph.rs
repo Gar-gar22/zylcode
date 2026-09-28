@@ -170,8 +170,15 @@ impl EvidenceNode {
         self
     }
 
-    pub fn with_evidence(mut self, kind: crate::claim::EvidenceKind, id: impl Into<String>) -> Self {
-        self.evidence_refs.push(EvidenceRef { kind, id: id.into() });
+    pub fn with_evidence(
+        mut self,
+        kind: crate::claim::EvidenceKind,
+        id: impl Into<String>,
+    ) -> Self {
+        self.evidence_refs.push(EvidenceRef {
+            kind,
+            id: id.into(),
+        });
         self
     }
 
@@ -284,7 +291,10 @@ impl EvidenceGraph {
             bail!("evidence node {}: summary must not be empty", node.id);
         }
         if node.actor.trim().is_empty() {
-            bail!("evidence node {}: actor must not be empty (§5: who initiated?)", node.id);
+            bail!(
+                "evidence node {}: actor must not be empty (§5: who initiated?)",
+                node.id
+            );
         }
         let _g = self.lock.lock().unwrap();
         let mut doc = self.load()?;
@@ -320,7 +330,11 @@ impl EvidenceGraph {
         if from == to {
             bail!("evidence edge: self-loop rejected");
         }
-        if doc.edges.iter().any(|e| e.from == from && e.to == to && e.relation == relation) {
+        if doc
+            .edges
+            .iter()
+            .any(|e| e.from == from && e.to == to && e.relation == relation)
+        {
             bail!("evidence edge: duplicate {from} -{relation:?}-> {to}");
         }
         let edge = EvidenceEdge {
@@ -381,7 +395,10 @@ impl EvidenceGraph {
             if node.kind == NodeKind::Intent {
                 break;
             }
-            match doc.edges.iter().find(|e| e.to == current && e.relation != EdgeKind::Contradicts)
+            match doc
+                .edges
+                .iter()
+                .find(|e| e.to == current && e.relation != EdgeKind::Contradicts)
             {
                 Some(e) => current = e.from.clone(),
                 None => break,
@@ -417,9 +434,12 @@ mod tests {
             NodeKind::Verification,
             NodeKind::Claim,
         ] {
-            let n = g.add_node(EvidenceNode::new(kind, format!("step {kind:?}"), "agent")).unwrap();
+            let n = g
+                .add_node(EvidenceNode::new(kind, format!("step {kind:?}"), "agent"))
+                .unwrap();
             if !prev.is_empty() {
-                g.add_edge(&prev, &n.id, EdgeKind::DerivesFrom, None).unwrap();
+                g.add_edge(&prev, &n.id, EdgeKind::DerivesFrom, None)
+                    .unwrap();
             }
             prev = n.id.clone();
         }
@@ -449,15 +469,18 @@ mod tests {
         let mut ids = Vec::new();
         for (i, kind) in kinds.iter().enumerate() {
             let n = g
-                .add_node(EvidenceNode::new(*kind, format!("n{i}"), "agent")
-                    .with_tool("cargo")
-                    .with_commit("abc123")
-                    .with_evidence(EvidenceKind::ProofRecord, format!("proof-{i}")))
+                .add_node(
+                    EvidenceNode::new(*kind, format!("n{i}"), "agent")
+                        .with_tool("cargo")
+                        .with_commit("abc123")
+                        .with_evidence(EvidenceKind::ProofRecord, format!("proof-{i}")),
+                )
                 .unwrap();
             ids.push(n.id);
         }
         for w in ids.windows(2) {
-            g.add_edge(&w[0], &w[1], EdgeKind::DerivesFrom, None).unwrap();
+            g.add_edge(&w[0], &w[1], EdgeKind::DerivesFrom, None)
+                .unwrap();
         }
         let chain = g.ancestry(&ids[9]).unwrap();
         assert_eq!(chain.len(), 10, "claim traces back through all stages");
@@ -469,7 +492,9 @@ mod tests {
     #[test]
     fn dangling_edge_refused() {
         let g = tmp_graph("dangling");
-        let n = g.add_node(EvidenceNode::new(NodeKind::Intent, "want it", "human")).unwrap();
+        let n = g
+            .add_node(EvidenceNode::new(NodeKind::Intent, "want it", "human"))
+            .unwrap();
         let r = g.add_edge(&n.id, "missing-node", EdgeKind::Produces, None);
         assert!(r.is_err());
         assert!(g.document().unwrap().edges.is_empty());
@@ -478,9 +503,12 @@ mod tests {
     #[test]
     fn self_loop_and_duplicate_refused() {
         let g = tmp_graph("loopy");
-        let n = g.add_node(EvidenceNode::new(NodeKind::Plan, "p", "agent")).unwrap();
+        let n = g
+            .add_node(EvidenceNode::new(NodeKind::Plan, "p", "agent"))
+            .unwrap();
         assert!(g.add_edge(&n.id, &n.id, EdgeKind::Links, None).is_err());
-        g.add_edge(n.id.clone(), n.id.clone(), EdgeKind::Links, None).ok();
+        g.add_edge(n.id.clone(), n.id.clone(), EdgeKind::Links, None)
+            .ok();
         // duplicate id node refused
         assert!(g.add_node(n.clone()).is_err());
     }
@@ -488,19 +516,28 @@ mod tests {
     #[test]
     fn empty_summary_or_actor_refused() {
         let g = tmp_graph("empty");
-        assert!(g.add_node(EvidenceNode::new(NodeKind::Action, "  ", "agent")).is_err());
-        assert!(g.add_node(EvidenceNode::new(NodeKind::Action, "x", "")).is_err());
+        assert!(g
+            .add_node(EvidenceNode::new(NodeKind::Action, "  ", "agent"))
+            .is_err());
+        assert!(g
+            .add_node(EvidenceNode::new(NodeKind::Action, "x", ""))
+            .is_err());
     }
 
     #[test]
     fn tamper_detection() {
         let g = tmp_graph("tamper");
-        let n = g.add_node(EvidenceNode::new(NodeKind::Result, "exit 0", "cargo")).unwrap();
+        let n = g
+            .add_node(EvidenceNode::new(NodeKind::Result, "exit 0", "cargo"))
+            .unwrap();
         assert!(g.verify_integrity().unwrap());
         let raw = std::fs::read_to_string(g.path()).unwrap();
         let tampered = raw.replace("exit 0", "exit 1");
         std::fs::write(g.path(), tampered).unwrap();
-        assert!(!g.verify_integrity().unwrap(), "tampered graph must not verify");
+        assert!(
+            !g.verify_integrity().unwrap(),
+            "tampered graph must not verify"
+        );
         let _ = n;
     }
 
@@ -512,6 +549,9 @@ mod tests {
         assert!(g.document().is_err());
         assert!(g.verify_integrity().is_err());
         std::fs::write(g.path(), "   ").unwrap();
-        assert!(g.document().is_err(), "blank file must not read as an empty valid graph");
+        assert!(
+            g.document().is_err(),
+            "blank file must not read as an empty valid graph"
+        );
     }
 }

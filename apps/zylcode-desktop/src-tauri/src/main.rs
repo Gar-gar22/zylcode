@@ -441,6 +441,41 @@ async fn file_content(
     .map_err(|e| format!("file task failed: {e}"))?
 }
 
+/// Save edited content to a workspace file — the desktop editor's save
+/// backend (G-03). Containment (absolute/`..`/`.git/`/symlink escapes) is
+/// enforced inside `save_file_payload` before any write happens.
+#[tauri::command]
+async fn save_workspace_artifact(
+    state: tauri::State<'_, EngineState>,
+    label: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    let root = std::path::PathBuf::from(&state.engine.config().workspace_root);
+    tokio::task::spawn_blocking(move || {
+        zylcode_core::surfaces::save_file_payload(&root, &label, &content)
+            .map_err(|e| format!("save failed: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("save task failed: {e}"))?
+}
+
+/// Apply a unified diff to the workspace — the artifact stream's Ctrl+Enter
+/// patch backend. Patch paths are validated before git runs; `git apply`
+/// fails closed on malformed hunks with byte-faithful line endings.
+#[tauri::command]
+async fn apply_patch(
+    state: tauri::State<'_, EngineState>,
+    patch: String,
+) -> Result<serde_json::Value, String> {
+    let root = std::path::PathBuf::from(&state.engine.config().workspace_root);
+    tokio::task::spawn_blocking(move || {
+        zylcode_core::surfaces::apply_patch_payload(&root, &patch)
+            .map_err(|e| format!("apply patch failed: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("patch task failed: {e}"))?
+}
+
 /// The evidence ledger timeline with hash-chain verification.
 #[tauri::command]
 async fn evidence_ledger(
@@ -1191,6 +1226,8 @@ fn main() {
             repo_search,
             repo_file_tree,
             file_content,
+            save_workspace_artifact,
+            apply_patch,
             app_version,
             evidence_ledger,
             token_metrics,

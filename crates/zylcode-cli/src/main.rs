@@ -1031,6 +1031,49 @@ async fn handle_serve_intel(workspace: &str, args: ServeIntelArgs) -> Result<()>
         }
     }
 
+    /// POST /api/artifact/save — editor-save transport parity for the
+    /// browser preview (the desktop uses the `save_workspace_artifact`
+    /// command). Both transports call the same `save_file_payload`, so
+    /// containment rules are identical everywhere.
+    async fn artifact_save(
+        State(root): State<Arc<std::path::PathBuf>>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let label = body["label"].as_str().unwrap_or("").to_string();
+        let content = body["content"].as_str().unwrap_or("").to_string();
+        let root = Arc::clone(&root);
+        let payload = tokio::task::spawn_blocking(move || {
+            zylcode_core::surfaces::save_file_payload(&root, &label, &content)
+                .unwrap_or_else(|e| serde_json::json!({ "error": format!("save failed: {e:#}") }))
+        })
+        .await;
+        match payload {
+            Ok(value) => Json(value),
+            Err(e) => Json(serde_json::json!({ "error": format!("save task failed: {e}") })),
+        }
+    }
+
+    /// POST /api/artifact/patch — apply-patch transport parity for the
+    /// browser preview (the desktop uses the `apply_patch` command); same
+    /// validated `git apply` path on both transports.
+    async fn artifact_patch(
+        State(root): State<Arc<std::path::PathBuf>>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let patch = body["patch"].as_str().unwrap_or("").to_string();
+        let root = Arc::clone(&root);
+        let payload = tokio::task::spawn_blocking(move || {
+            zylcode_core::surfaces::apply_patch_payload(&root, &patch).unwrap_or_else(
+                |e| serde_json::json!({ "error": format!("apply patch failed: {e:#}") }),
+            )
+        })
+        .await;
+        match payload {
+            Ok(value) => Json(value),
+            Err(e) => Json(serde_json::json!({ "error": format!("patch task failed: {e}") })),
+        }
+    }
+
     async fn terminal_exec(
         State(hub): State<Arc<zylcode_core::terminal::TerminalHub>>,
         axum::Json(req): axum::Json<zylcode_core::terminal::TerminalRequest>,
@@ -1313,6 +1356,8 @@ async fn handle_serve_intel(workspace: &str, args: ServeIntelArgs) -> Result<()>
         .route("/api/search", get(search))
         .route("/api/files", get(file_tree))
         .route("/api/file-content", get(file_content))
+        .route("/api/artifact/save", axum::routing::post(artifact_save))
+        .route("/api/artifact/patch", axum::routing::post(artifact_patch))
         .route("/api/evidence", get(evidence))
         .route("/api/terminal/exec", axum::routing::post(terminal_exec))
         .route("/api/terminal/reset", axum::routing::post(terminal_reset))
