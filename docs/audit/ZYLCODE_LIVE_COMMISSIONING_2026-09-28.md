@@ -189,3 +189,17 @@ blocked externally by credentials/billing — not by repository code.
    valid OpenRouter/Anthropic key); the probe re-runs in seconds.
 2. Wave B references/imports/dependency graph (deterministic, no LLM).
 3. Attempt packaged Tauri desktop build/launch (INSTALLED_DESKTOP_RUNTIME).
+
+---
+
+## 10. Git checkpoint (recorded after push)
+
+- **Branch:** `main` → `origin/main` (`https://github.com/zylvex-tech/zylcode.git`)
+- **Checkpoint commits:**
+  - `93eb3d2` — feat(mission): First Mission runner — failure taxonomy, real-tool e2e, kill/resume
+  - `6b50a8b` — feat(runtime): auto-recovery for backend-dependent surfaces + editor write backends
+  - (earlier same-day: `f9ba68b` branding, `58d7ce7` evidence foundation — pushed in the same checkpoint)
+- **Push verification:** `git fetch origin` after push; local HEAD == `origin/main` == `6b50a8b`; ahead 0 / behind 0.
+- **Verification date:** 2026-09-28
+- **Gates at checkpoint (exact worktree):** cargo test **584 passed / 0 failed** (18 binaries), `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean, `cargo fmt --check` clean; frontend `pnpm test` **67/67**, `tsc --noEmit` clean. Secret gate on all staged patches: clean (no credentials, tokens, or headers committed).
+- Note: this section was appended as a trailing docs commit because the checkpoint commits were already pushed; the docs commit itself necessarily does not contain its own SHA.
