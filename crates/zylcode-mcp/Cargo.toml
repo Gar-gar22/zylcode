@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 notify = { workspace = true }
 sha2 = { workspace = true }
+zylcode-nav = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.31", features = ["bundled"], default-features = false }

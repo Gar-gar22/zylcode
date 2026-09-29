@@ -68,6 +68,132 @@ impl ModelClient for TestModelClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Provider-bound request (G3)
+//
+// The model never sees `session.messages`: every request is assembled
+// locally from the task, the plan and this loop's gathered intelligence, and
+// then handed to `ModelClient::call` as two strings. Repository-intelligence
+// citations therefore had to be carried on the *session* — not merely stored
+// as a message — or they stop at the boundary exactly where the previous
+// commissioning found them stopping.
+// ---------------------------------------------------------------------------
+
+/// System prompt sent with every provider-bound request.
+const BASE_SYSTEM_PROMPT: &str = "You are an expert software engineering agent. You must respond with valid JSON matching the AgentDecision protocol.";
+
+/// Upper bound on citation lines carried by one request.
+///
+/// `ContextBuilder` gathers with the same limit, so this is the belt to the
+/// gatherer's braces: even a future caller that gathers more cannot push an
+/// unbounded block through this boundary.
+pub const REPO_CONTEXT_MAX_CITATIONS: usize = 12;
+
+/// Byte budget for the rendered citation block, applied to **whole lines**.
+///
+/// A citation is never cut in half — `file:line` integrity is the whole point
+/// of the block — so overflowing lines are dropped and the drop is stated
+/// rather than silent.
+pub const REPO_CONTEXT_MAX_CHARS: usize = 4_096;
+
+/// The two strings handed to the provider. This *is* the dispatch boundary:
+/// [`AgentLoop::call_model`] passes them to [`ModelClient::call`] unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRequest {
+    pub prompt: String,
+    pub system: String,
+}
+
+/// Render gathered citations as the block prepended to every request.
+///
+/// Returns `None` when there is nothing to say — never an empty block, which
+/// would read to a model as "no relationships exist". Truncation is
+/// deterministic (first N whole lines within the byte budget) and always
+/// announced in the output, so a reviewer can see exactly what was dropped.
+pub fn repository_context_block(citations: &[String]) -> Option<String> {
+    if citations.is_empty() {
+        return None;
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    let mut dropped = 0usize;
+
+    for (index, line) in citations.iter().enumerate() {
+        if index >= REPO_CONTEXT_MAX_CITATIONS {
+            dropped += citations.len() - index;
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // +1 for the newline that will join it.
+        if used + line.len() + 1 > REPO_CONTEXT_MAX_CHARS {
+            if kept.is_empty() {
+                // Never drop *everything*: one whole citation is always
+                // cheaper than an unbounded claim.
+                kept.push(line);
+                dropped += citations.len() - index - 1;
+                break;
+            }
+            dropped += citations.len() - index;
+            break;
+        }
+        used += line.len() + 1;
+        kept.push(line);
+    }
+
+    if kept.is_empty() {
+        return None;
+    }
+
+    // The header has to describe what is actually below it: calling a single
+    // "no evidence exists" marker "Deterministic evidence resolved from the
+    // parsed repository index" would be the same class of overstatement the
+    // wave forbids everywhere else.
+    let carries_evidence = kept.iter().any(|line| line.starts_with("DETERMINISTIC"));
+    let mut block = String::from(if carries_evidence {
+        "REPOSITORY INTELLIGENCE CONTEXT\n\n\
+         Deterministic evidence resolved from the parsed repository index:\n"
+    } else {
+        "REPOSITORY INTELLIGENCE CONTEXT\n\n\
+         No graph evidence is available for this task:\n"
+    });
+    for line in &kept {
+        block.push_str(line);
+        block.push('\n');
+    }
+    if dropped > 0 {
+        block.push_str(&format!(
+            "… {dropped} further citation line{} omitted by the repository-context \
+             budget ({} lines / {} bytes) — their absence is a budget limit, not a \
+             finding.\n",
+            if dropped == 1 { "" } else { "s" },
+            REPO_CONTEXT_MAX_CITATIONS,
+            REPO_CONTEXT_MAX_CHARS,
+        ));
+    }
+    block.push_str(
+        "\nInstructions:\n\
+         - Treat the lines above as repository evidence for this task.\n\
+         - Cite the `file:line` locations above when you make a repository-specific claim.\n\
+         - Do not claim a file, symbol or relationship that is not covered above.\n\
+         - If the lines above say no graph evidence exists, do not invent one.\n\
+         - Anything not covered above is your own interpretation — label it as such, and \
+         never present an inference as a graph fact.",
+    );
+    Some(block)
+}
+
+/// Prepend the repository block to `prompt`, when there is one.
+fn with_repository_context(prompt: &str, citations: &[String]) -> String {
+    match repository_context_block(citations) {
+        Some(block) => format!("{block}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
+
 /// Agent execution state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AgentState {
@@ -167,6 +293,18 @@ pub struct SessionContext {
     pub plan: Option<String>,
     pub verification_status: Option<bool>,
     pub pending_tool_call: Option<ToolCallRequest>,
+    /// Deterministic repository-graph evidence gathered for this session's
+    /// goal, in the engine's own words (`agent_citation_block` via
+    /// `ContextBuilder::build`).
+    ///
+    /// Held here and not only inside `session.messages`, because the
+    /// messages are never serialized into a provider request — the loop
+    /// builds each request from the task, the plan and this field (G3).
+    /// `#[serde(default)]` keeps checkpoints written before this field
+    /// existed readable: they resume with *no* citations rather than with a
+    /// fabricated empty block.
+    #[serde(default)]
+    pub navigation_citations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +438,7 @@ impl AgentLoop {
                 plan: None,
                 verification_status: None,
                 pending_tool_call: None,
+                navigation_citations: Vec::new(),
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -699,14 +838,35 @@ impl AgentLoop {
             .build(&task_desc, &self.session.context.files_read)
             .await?;
 
+        // Keep the citations on the session, not only inside `messages`.
+        // `messages` never reaches a provider request (G3): this field is
+        // what `provider_request` reads when it builds the strings the model
+        // actually receives. Replacing rather than appending keeps a re-gather
+        // from stacking stale evidence for an older goal.
+        self.session.context.navigation_citations = context.navigation_citations.clone();
+
         // Add context to session messages as system message
-        let context_str = format!(
+        let mut context_str = format!(
             "Workspace: {}\nFiles: {:?}\nRelevant: {:?}\nGit: {:?}",
             context.workspace_root,
             context.file_tree.len(),
             context.relevant_files,
             context.git_status
         );
+
+        // Repository-graph evidence, kept separate from the ranked file list
+        // because the two carry different weight: the list is retrieval, these
+        // lines are resolved facts the model is expected to quote.
+        if !context.navigation_citations.is_empty() {
+            context_str.push_str(&format!(
+                "\n\nRepository graph evidence (deterministic, resolved from the parsed \
+repository index):\n{}\n\
+Cite these locations when you make a structural claim about this code. Anything not \
+covered by a line above is your own interpretation — label it as such, and never \
+present an inference as a graph fact.",
+                context.navigation_citations.join("\n")
+            ));
+        }
 
         self.add_system_message(format!("Context gathered:\n{}", context_str));
 
@@ -1491,11 +1651,28 @@ impl AgentLoop {
     }
 
     /// Call the model with a prompt and parse the response
-    async fn call_model(&self, prompt: &str) -> Result<AgentDecision> {
-        // Use the model client to call the model
-        let system_prompt = "You are an expert software engineering agent. You must respond with valid JSON matching the AgentDecision protocol.";
+    /// Build the exact request handed to the provider for `prompt`.
+    ///
+    /// This is the dispatch boundary: [`Self::call_model`] passes these two
+    /// strings to [`ModelClient::call`] untouched, so repository intelligence
+    /// only reaches the model if it is present here. Everything the loop
+    /// stores anywhere else — messages, checkpoints, the index on disk — is
+    /// invisible to the model.
+    fn provider_request(&self, prompt: &str) -> ProviderRequest {
+        ProviderRequest {
+            prompt: with_repository_context(prompt, &self.session.context.navigation_citations),
+            system: BASE_SYSTEM_PROMPT.to_string(),
+        }
+    }
 
-        let response = self.model_client.call(prompt, system_prompt).await?;
+    async fn call_model(&self, prompt: &str) -> Result<AgentDecision> {
+        // The single place a request is assembled for the provider.
+        let request = self.provider_request(prompt);
+
+        let response = self
+            .model_client
+            .call(&request.prompt, &request.system)
+            .await?;
 
         // Parse the response as JSON
         // Try to extract JSON from the response
@@ -1865,5 +2042,377 @@ mod tests {
                 "the loop's actor binding must reach every persisted record"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // G3 — repository intelligence at the provider boundary
+    //
+    // The failure these replace: citations were computed, written into
+    // `session.messages`, and then never serialized into any request the model
+    // received — every model-facing prompt was assembled from the task and
+    // plan alone. Every test below therefore observes the *boundary*: the
+    // strings handed to `ModelClient::call`. A test one layer earlier (the
+    // context builder, the session transcript) would have passed the whole
+    // time while the model stayed blind.
+    // -----------------------------------------------------------------------
+
+    /// A fixture the navigation index can actually resolve: `helper` is
+    /// declared in `src/util.rs` and called from `src/lib.rs`.
+    fn intel_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("cargo.toml");
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod util;\n\npub fn entry() -> u32 {\n    util::helper()\n}\n",
+        )
+        .expect("lib.rs");
+        std::fs::write(src.join("util.rs"), "pub fn helper() -> u32 {\n    1\n}\n")
+            .expect("util.rs");
+        dir
+    }
+
+    /// Records the exact strings handed to the provider — this *is* the
+    /// dispatch boundary under test.
+    struct RecordingModelClient {
+        responses: Vec<String>,
+        index: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl RecordingModelClient {
+        fn new(responses: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                responses,
+                index: std::sync::atomic::AtomicUsize::new(0),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<ProviderRequest> {
+            self.seen.lock().expect("recorder poisoned").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelClient for RecordingModelClient {
+        async fn call(&self, prompt: &str, system: &str) -> Result<String> {
+            self.seen
+                .lock()
+                .expect("recorder poisoned")
+                .push(ProviderRequest {
+                    prompt: prompt.to_string(),
+                    system: system.to_string(),
+                });
+            let idx = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.responses.get(idx).cloned().unwrap_or_else(|| {
+                r#"{"action": "Complete", "payload": {"summary": "Task completed", "evidence": [], "remaining_limitations": []}}"#
+                    .to_string()
+            }))
+        }
+    }
+
+    fn loop_over(dir: &std::path::Path, goal: &str) -> (AgentLoop, Arc<RecordingModelClient>) {
+        let client = RecordingModelClient::new(Vec::new());
+        let agent = AgentLoop::new(
+            goal,
+            dir.to_path_buf(),
+            None,
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&client) as Arc<dyn ModelClient>,
+            Arc::new(MemoryLedgerStore::new()),
+        );
+        (agent, client)
+    }
+
+    #[tokio::test]
+    async fn gathered_citations_are_deterministic_and_stored_on_the_session() {
+        let dir = intel_fixture();
+        let (mut agent, _client) = loop_over(dir.path(), "find where helper is used");
+
+        agent.gather_context().await.expect("context gathers");
+
+        let citations = &agent.session.context.navigation_citations;
+        assert!(!citations.is_empty(), "citations must be produced");
+        assert!(
+            citations
+                .iter()
+                .all(|line| line.starts_with("DETERMINISTIC")),
+            "only deterministic evidence is offered to the model: {citations:?}"
+        );
+        assert!(
+            citations.iter().any(|line| line.contains(".rs:")),
+            "expected a file:line location, got {citations:?}"
+        );
+        // H, part one: the evidence still reaches the session transcript too.
+        assert!(
+            agent
+                .session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Repository graph evidence")),
+            "the session transcript must still carry the evidence block"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_provider_bound_request_contains_the_deterministic_citations() {
+        let dir = intel_fixture();
+        let (mut agent, client) = loop_over(dir.path(), "find where helper is used");
+        agent.gather_context().await.expect("context gathers");
+
+        let request = agent.provider_request("Answer the task.");
+        assert!(
+            request
+                .prompt
+                .starts_with("REPOSITORY INTELLIGENCE CONTEXT"),
+            "context must precede the task: {}",
+            request.prompt
+        );
+        assert!(
+            request.prompt.ends_with("Answer the task."),
+            "the task prompt must remain intact: {}",
+            request.prompt
+        );
+        assert!(request.prompt.contains(".rs:"), "{}", request.prompt);
+        assert_eq!(request.system, BASE_SYSTEM_PROMPT);
+
+        // Through the real dispatch: `call_model` hands these two strings to
+        // `ModelClient::call` with nothing inserted or dropped in between.
+        agent
+            .call_model("Answer the task.")
+            .await
+            .expect("model answers");
+
+        let seen = client.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].prompt, request.prompt,
+            "what was built is what was sent"
+        );
+        assert_eq!(seen[0].system, request.system);
+        assert!(
+            seen[0].prompt.contains("DETERMINISTIC ·"),
+            "{}",
+            seen[0].prompt
+        );
+        assert!(seen[0].prompt.contains(".rs:"), "{}", seen[0].prompt);
+    }
+
+    #[tokio::test]
+    async fn every_request_of_a_real_run_carries_the_repository_context() {
+        let dir = intel_fixture();
+        let client = RecordingModelClient::new(vec![
+            r#"{"action": "Plan", "payload": {"steps": [{"id": "1", "description": "Read the source", "expected_files": ["src/lib.rs"], "expected_tools": ["fs.read"], "risk": "Read", "verification": "file read"}]}}"#.to_string(),
+            r#"{"action": "ToolCall", "payload": {"tool_id": "fs.read", "arguments": {"action": "read", "path": "Cargo.toml"}, "reason": "inspect the manifest", "expected_result": "file content"}}"#.to_string(),
+            r#"{"action": "Complete", "payload": {"summary": "done", "evidence": ["read"], "remaining_limitations": []}}"#.to_string(),
+        ]);
+
+        let registry = Arc::new(ToolRegistry::new());
+        let fs_cfg = McpToolConfig {
+            id: "fs.read".into(),
+            command: "read".into(),
+            transport: McpTransport::Stdio,
+            env: Default::default(),
+            enabled: true,
+            description: None,
+        };
+        registry.register(Arc::new(DynamicTool::new(fs_cfg))).await;
+
+        let mut agent = AgentLoop::new(
+            "find where helper is used",
+            dir.path().to_path_buf(),
+            None,
+            registry,
+            Arc::clone(&client) as Arc<dyn ModelClient>,
+            Arc::new(MemoryLedgerStore::new()),
+        );
+        agent.run().await.expect("run completes");
+
+        let seen = client.seen();
+        assert!(
+            seen.len() >= 3,
+            "expected several model turns, got {}",
+            seen.len()
+        );
+        for (i, request) in seen.iter().enumerate() {
+            assert!(
+                request
+                    .prompt
+                    .starts_with("REPOSITORY INTELLIGENCE CONTEXT"),
+                "request {i} is blind to the repository index: {}",
+                request.prompt
+            );
+            assert!(
+                request.prompt.contains("DETERMINISTIC ·"),
+                "request {i} carries no deterministic citation: {}",
+                request.prompt
+            );
+            assert_eq!(request.system, BASE_SYSTEM_PROMPT, "request {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_names_no_symbol_receives_no_repository_evidence() {
+        let dir = intel_fixture();
+        let (mut agent, _client) = loop_over(dir.path(), "write a haiku about the ocean");
+
+        agent.gather_context().await.expect("context gathers");
+
+        let request = agent.provider_request("Answer the task.");
+        assert!(
+            !request.prompt.contains("DETERMINISTIC"),
+            "an unrelated turn must not be handed repository evidence: {}",
+            request.prompt
+        );
+        assert!(
+            !request.prompt.contains(".rs:"),
+            "an unrelated turn must not be handed file locations: {}",
+            request.prompt
+        );
+        assert!(
+            request.prompt.contains("No graph evidence is available"),
+            "the absence must be stated, not left blank: {}",
+            request.prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbuildable_index_states_itself_in_the_request_instead_of_leaving_a_hole() {
+        let missing = std::env::temp_dir().join(format!("zylcode-g3-{}", Uuid::new_v4()));
+        let (mut agent, _client) = loop_over(&missing, "find where helper is used");
+
+        agent.gather_context().await.expect("context gathers");
+
+        let citations = &agent.session.context.navigation_citations;
+        assert_eq!(citations.len(), 1, "{citations:?}");
+        assert!(
+            citations[0].contains("repository graph unavailable"),
+            "the engine's own words must survive: {citations:?}"
+        );
+
+        let request = agent.provider_request("Answer the task.");
+        assert!(
+            request.prompt.contains("repository graph unavailable"),
+            "{}",
+            request.prompt
+        );
+        assert!(
+            !request.prompt.contains("DETERMINISTIC"),
+            "an unavailable index must never be rendered as an empty citation list: {}",
+            request.prompt
+        );
+        assert!(
+            !missing.exists(),
+            "gathering must never create a workspace that was not there (G6)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_built_before_any_intelligence_is_gathered_carries_nothing() {
+        let dir = intel_fixture();
+        let (agent, _client) = loop_over(dir.path(), "find where helper is used");
+
+        let request = agent.provider_request("Answer the task.");
+        assert_eq!(request.prompt, "Answer the task.");
+        assert!(!request.prompt.contains("REPOSITORY INTELLIGENCE CONTEXT"));
+    }
+
+    #[test]
+    fn the_repository_context_budget_is_deterministic_and_announced() {
+        let citations: Vec<String> = (0..50)
+            .map(|i| format!("DETERMINISTIC · sym{i} @ src/f{i}.rs:{i} — declared — excerpt {i}"))
+            .collect();
+
+        let first = repository_context_block(&citations).expect("block renders");
+        let second = repository_context_block(&citations).expect("block renders");
+        assert_eq!(first, second, "rendering must be deterministic");
+
+        for line in citations.iter().take(REPO_CONTEXT_MAX_CITATIONS) {
+            assert!(first.contains(line.as_str()), "kept line missing: {line}");
+        }
+        for line in citations.iter().skip(REPO_CONTEXT_MAX_CITATIONS) {
+            assert!(
+                !first.contains(line.as_str()),
+                "dropped line leaked: {line}"
+            );
+        }
+        assert!(
+            first.contains("omitted by the repository-context budget"),
+            "truncation must be stated: {first}"
+        );
+        assert!(
+            first.len() <= REPO_CONTEXT_MAX_CHARS + 1_024,
+            "{}",
+            first.len()
+        );
+
+        // Byte cap: lines are dropped whole, never cut through a `file:line`.
+        let long: Vec<String> = (0..4)
+            .map(|i| {
+                format!(
+                    "DETERMINISTIC · s{i} @ src/f{i}.rs:{i} — declared — {}",
+                    "x".repeat(REPO_CONTEXT_MAX_CHARS)
+                )
+            })
+            .collect();
+        let block = repository_context_block(&long).expect("block renders");
+        assert!(
+            block.lines().any(|l| l == long[0]),
+            "the first citation must survive whole: {block}"
+        );
+        assert!(
+            !block.contains(long[1].as_str()),
+            "the second must be dropped whole"
+        );
+        assert!(
+            block.contains("omitted by the repository-context budget"),
+            "truncation must be stated: {block}"
+        );
+        assert!(
+            block.len() <= REPO_CONTEXT_MAX_CHARS + 1_024,
+            "{}",
+            block.len()
+        );
+    }
+
+    #[test]
+    fn citations_survive_session_serialisation_and_legacy_records_read_as_empty() {
+        let citations = vec![
+            "DETERMINISTIC · util::helper @ src/util.rs:1 — declared — pub fn helper() -> u32"
+                .to_string(),
+        ];
+        let ctx = SessionContext {
+            working_directory: PathBuf::from("."),
+            files_read: vec![],
+            files_modified: vec![],
+            commands_executed: vec![],
+            test_results: vec![],
+            plan: None,
+            verification_status: None,
+            pending_tool_call: None,
+            navigation_citations: citations.clone(),
+        };
+
+        let json = serde_json::to_string(&ctx).expect("serialises");
+        assert!(json.contains("src/util.rs:1"), "{json}");
+
+        let back: SessionContext = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back.navigation_citations, citations);
+
+        // A checkpoint written before the field existed still reads: it resumes
+        // with *no* citations, never with a fabricated empty block.
+        let mut legacy = serde_json::to_value(&ctx).expect("to value");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("navigation_citations");
+        let restored: SessionContext = serde_json::from_value(legacy).expect("legacy reads");
+        assert!(restored.navigation_citations.is_empty());
     }
 }

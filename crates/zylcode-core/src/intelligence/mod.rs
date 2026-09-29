@@ -14,6 +14,7 @@ pub mod dependency;
 pub mod entry_points;
 pub mod git;
 pub mod manifest;
+pub mod nav_api;
 pub mod persisted;
 pub mod query;
 pub mod scanner;

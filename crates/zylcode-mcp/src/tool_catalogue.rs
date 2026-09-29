@@ -38,8 +38,9 @@
 //! # Provenance
 //!
 //! Derived from `docs/governance/TOOL_CATALOGUE_TRUTH_TABLE.md`. The bridge is
-//! 0 REAL / 27 SIMULATED / 27 UNREACHABLE; `real_tools` provides 12 real
-//! executors. The historical `>= 100` / `>= 150` / `>= 25` assertions were
+//! 0 REAL / 27 SIMULATED / 27 UNREACHABLE; `real_tools` provides 20 real
+//! executors — 12 general-purpose plus the 8 read-only repository-intelligence
+//! (`nav.*`) tools. The historical `>= 100` / `>= 150` / `>= 25` assertions were
 //! calibrated to a tool surface that was never committed and are not product
 //! requirements.
 
@@ -235,6 +236,152 @@ fn search_schema() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Repository intelligence (`nav.*`)
+//
+// These are answered by `zylcode-nav` from the parsed index. Their schemas say
+// so explicitly, because a model that believes it is searching text will ask
+// for a search; a model that knows it is asking the index will send a selector.
+// ---------------------------------------------------------------------------
+
+/// The symbol selector, in the nested `target` form the engine deserialises.
+fn selector_object() -> Value {
+    json!({
+        "type": "object",
+        "description": "Name a symbol by exactly one form. An ambiguous name returns `candidates` rather than a guess, and an unresolvable one returns `unresolved` rather than an invented hit.",
+        "properties": {
+            "id": {"type": "string", "description": "Symbol id from an earlier result"},
+            "qualified_name": {"type": "string", "description": "Fully qualified name, e.g. `crate::util::helper`"},
+            "crate_key": {"type": "string", "description": "Crate/module key, used to disambiguate a shared qualified name"},
+            "file": {"type": "string", "description": "Repository-relative path of the declaring file"},
+            "name": {"type": "string", "description": "Bare name; paired with `file` it is scoped to that file"},
+            "line": {"type": "integer", "minimum": 1, "description": "1-based line, for go-to-definition at a position"}
+        }
+    })
+}
+
+/// The same vocabulary as flat top-level keys, which the engine also accepts.
+fn selector_properties() -> Value {
+    selector_object()
+        .get("properties")
+        .cloned()
+        .expect("`selector_object` defines `properties`")
+}
+
+/// Object schema for the four symbol-addressed nav tools: the selector in
+/// both forms, plus whatever options the tool takes.
+fn nav_selector_schema(description: &str, extra: Value) -> Value {
+    let mut properties = selector_properties()
+        .as_object()
+        .cloned()
+        .expect("selector properties are an object");
+    properties.insert("target".to_string(), selector_object());
+    if let Some(extra) = extra.as_object() {
+        for (key, value) in extra {
+            properties.insert(key.clone(), value.clone());
+        }
+    }
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": Value::Object(properties)
+    })
+}
+
+/// Object schema for the file-addressed nav tools.
+fn nav_file_schema(description: &str, extra: Value) -> Value {
+    let mut properties = extra.as_object().cloned().unwrap_or_default();
+    properties.insert(
+        "file".to_string(),
+        json!({
+            "type": "string",
+            "description": "Repository-relative path of the file to analyse"
+        }),
+    );
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": Value::Object(properties),
+        "required": ["file"]
+    })
+}
+
+fn nav_find_definition_schema() -> Value {
+    nav_selector_schema(
+        "Resolve a symbol to its declaration: qualified name, kind, file, line, range, container and signature. Read-only, deterministic, from the parsed index.",
+        json!({}),
+    )
+}
+
+fn nav_find_references_schema() -> Value {
+    nav_selector_schema(
+        "Find every reference to a symbol, with file, line, range and reference type. Each hit carries `evidence`: `deterministic` for index-resolved references, `heuristic` for textual correspondence the index could not attribute. References are never fabricated.",
+        json!({
+            "include_definition": {"type": "boolean", "default": true, "description": "Include the declaration itself in the results"},
+            "include_possible": {"type": "boolean", "default": true, "description": "Include unattributed textual correspondences in the `possible` bucket"},
+            "limit": {"type": "integer", "minimum": 1, "default": 500, "description": "Maximum references returned"}
+        }),
+    )
+}
+
+fn nav_find_callers_schema() -> Value {
+    nav_selector_schema(
+        "Find what calls a symbol. Every relation is labelled `deterministic`, `heuristic` or `unsupported`; a text match is never presented as a semantic caller.",
+        json!({
+            "limit": {"type": "integer", "minimum": 1, "default": 500, "description": "Maximum relations returned"}
+        }),
+    )
+}
+
+fn nav_find_callees_schema() -> Value {
+    nav_selector_schema(
+        "Find what a symbol calls from inside its declaration. Every relation is labelled `deterministic`, `heuristic` or `unsupported`.",
+        json!({
+            "limit": {"type": "integer", "minimum": 1, "default": 500, "description": "Maximum relations returned"}
+        }),
+    )
+}
+
+fn nav_file_dependencies_schema() -> Value {
+    nav_file_schema(
+        "Outgoing edges of a file: what it imports and depends on, each edge carrying provenance back to the source construct.",
+        json!({}),
+    )
+}
+
+fn nav_file_dependents_schema() -> Value {
+    nav_file_schema(
+        "Incoming edges of a file: what imports or depends on it, each edge carrying provenance back to the source construct.",
+        json!({}),
+    )
+}
+
+fn nav_symbol_impact_schema() -> Value {
+    nav_selector_schema(
+        "Relationships a change to the subject could reach: `direct_dependent`, `transitive_dependent`, `possible_textual_reference`, `unresolved`. This reports relationships, not predictions — it never claims a change will break something.",
+        json!({
+            "subject": {"type": "string", "enum": ["file", "symbol"], "description": "`file` analyses a file (also implied by passing `file` with no selector); anything else analyses a symbol"},
+            "depth": {"type": "integer", "minimum": 1, "default": 3, "description": "How many hops of the dependency graph to walk"},
+            "limit": {"type": "integer", "minimum": 1, "default": 500, "description": "Maximum relationships returned"}
+        }),
+    )
+}
+
+fn nav_repository_graph_query_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Query the repository graph with filtering and scoping. Edges carry their kind and provenance, so a result can always be traced back to a construct in the source.",
+        "properties": {
+            "edge_kinds": {"type": "array", "items": {"type": "string"}, "description": "Keep only these edge kinds (e.g. `imports`, `calls`, `depends_on`)"},
+            "node_kinds": {"type": "array", "items": {"type": "string"}, "description": "Keep only nodes of these kinds (e.g. `file`, `symbol`, `crate`)"},
+            "focus": {"type": "string", "description": "Restrict the result to the neighbourhood of this node id"},
+            "depth": {"type": "integer", "minimum": 1, "default": 1, "description": "Hops from `focus` to expand; 1 keeps only edges touching it"},
+            "limit": {"type": "integer", "minimum": 1, "default": 500, "description": "Maximum edges returned"},
+            "include_cycles": {"type": "boolean", "default": false, "description": "Report cycles found in the traversed subgraph"}
+        }
+    })
+}
+
 /// The executable foundation. Every id here has a real executor in
 /// [`crate::real_tools`] **and** a deterministic dispatch binding enforced by
 /// that executor.
@@ -364,7 +511,106 @@ const EXECUTABLE_SPECS: &[ExecutableSpec] = &[
         product_reachable: true,
         rung: EvidenceRung::R1Observed,
     },
+    // ------------------------------------------------ repository intelligence
+    //
+    // All eight are answered by `zylcode-nav` from the parsed index: no text
+    // search, no inference, no fabrication. `tested: true` and rung R2 refer to
+    // `crates/zylcode-mcp/tests/nav_tools.rs`, which drives each executor
+    // through `real_tools::dispatch` against a fixture repository.
+    ExecutableSpec {
+        id: "nav.find_definition",
+        description: "Resolve a symbol to its declaration (name, kind, file, line, range, container, signature)",
+        schema: nav_find_definition_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `find_definition`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.find_references",
+        description: "Find every reference to a symbol, each labelled by evidence; never fabricated",
+        schema: nav_find_references_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `find_references`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.find_callers",
+        description: "Find what calls a symbol; every relation labelled deterministic, heuristic or unsupported",
+        schema: nav_find_callers_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `find_callers`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.find_callees",
+        description: "Find what a symbol calls; every relation labelled deterministic, heuristic or unsupported",
+        schema: nav_find_callees_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `find_callees`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.file_dependencies",
+        description: "Outgoing dependency edges of a file, each with provenance",
+        schema: nav_file_dependencies_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `file_dependencies`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.file_dependents",
+        description: "Incoming dependency edges of a file, each with provenance",
+        schema: nav_file_dependents_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `file_dependents`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.symbol_impact",
+        description: "Relationships a change could reach (direct, transitive, possible textual, unresolved) — relationships, not predictions",
+        schema: nav_symbol_impact_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `symbol_impact`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
+    ExecutableSpec {
+        id: "nav.repository_graph_query",
+        description: "Query the repository graph with kind, focus, depth and cycle filtering",
+        schema: nav_repository_graph_query_schema,
+        risk: RiskLevel::Read,
+        bound_operation: Some("repository intelligence `repository_graph_query`"),
+        tested: true,
+        product_reachable: true,
+        rung: EvidenceRung::R2Executed,
+    },
 ];
+
+/// The catalogue's own description for a real executor, by id.
+///
+/// The catalogue is the single source of truth for what a tool is called and
+/// what it does, so the executor borrows its description from here rather than
+/// restating it. Returns `""` for an id that is not executable.
+pub fn executable_description(tool_id: &str) -> &'static str {
+    EXECUTABLE_SPECS
+        .iter()
+        .find(|spec| spec.id == tool_id)
+        .map(|spec| spec.description)
+        .unwrap_or("")
+}
 
 fn default_permissions_for(risk: RiskLevel) -> ToolPermissions {
     match risk {
@@ -757,16 +1003,20 @@ mod tests {
     fn metrics_match_the_governance_record() {
         let m = Catalogue::canonical().metrics();
         assert_eq!(
-            m.definition_count, 38,
-            "12 executable + 27 bridge definitions - 1 overlap (git.commit)"
-        );
-        assert_eq!(m.executable_count, 12);
-        assert_eq!(
-            m.tested_execution_count, 2,
-            "only fs.read and shell.execute are exercised by committed tests"
+            m.definition_count, 46,
+            "20 executable + 27 bridge definitions - 1 overlap (git.commit)"
         );
         assert_eq!(
-            m.product_reachable_count, 11,
+            m.executable_count, 20,
+            "12 general-purpose + 8 repository-intelligence (nav.*) executors"
+        );
+        assert_eq!(
+            m.tested_execution_count, 10,
+            "fs.read and shell.execute, plus the 8 nav.* tools exercised in \
+             tests/nav_tools.rs"
+        );
+        assert_eq!(
+            m.product_reachable_count, 19,
             "git.commit is not product-reachable"
         );
         assert_eq!(m.r3_verified_count, 0);

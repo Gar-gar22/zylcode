@@ -1110,6 +1110,11 @@ pub fn get_real_tool(tool_id: &str) -> Option<Box<dyn RealTool>> {
             Some(Box::new(GitTool::new(tool_id, "Git Tool")))
         }
         "search.find" | "search.grep" => Some(Box::new(SearchTool::new(tool_id, "Search Tool"))),
+        // Repository intelligence. Every `nav.*` id maps to exactly one engine
+        // tool — see `crate::nav_tools::payload_id`.
+        id if crate::nav_tools::is_nav_tool(id) => {
+            Some(Box::new(crate::nav_tools::NavTool::new(id)))
+        }
         _ => None,
     }
 }

@@ -2,6 +2,7 @@
 members = [
     "crates/zylcode-core",
     "crates/zylcode-mcp",
+    "crates/zylcode-nav",
     "crates/zylcode-cli",
     "apps/zylcode-desktop/src-tauri",
 ]
@@ -21,6 +22,16 @@ rust-version = "1.77"
 # internal deps to their crates.io versions (publishing fails without it).
 zylcode-core = { path = "crates/zylcode-core", version = "0.2.0" }
 zylcode-mcp = { path = "crates/zylcode-mcp", version = "0.2.0" }
+# Leaf crate: deterministic repository navigation (AST, symbols, references,
+# graphs). Sits *below* both zylcode-core and zylcode-mcp so neither has to
+# depend on the other (core -> mcp is the only edge between them).
+zylcode-nav = { path = "crates/zylcode-nav", version = "0.2.0" }
+
+# Repository Navigation (AST parsing for symbols/references/imports)
+tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
 
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }

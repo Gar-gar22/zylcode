@@ -5,7 +5,7 @@ import { fetchGitStatus, type GitStatusState } from "../../lib/gitStatus";
 import { fetchEvidence, type EvidenceState } from "../../lib/surfaces";
 
 interface ContextSidebarProps {
-  activeActivity: "explorer" | "search" | "source-control" | "missions" | "run" | "evidence" | "forge" | "extensions" | "settings" | "account";
+  activeActivity: "explorer" | "search" | "source-control" | "intel" | "missions" | "run" | "evidence" | "forge" | "extensions" | "settings" | "account";
   children?: React.ReactNode;
 }
 
@@ -20,6 +20,28 @@ export function ContextSidebar({ activeActivity, children }: ContextSidebarProps
 
       case "source-control":
         return <SourceControlSummary />;
+
+      case "intel":
+        return (
+          <Panel title="CODE NAVIGATION">
+            <div className="space-y-2 text-sm">
+              <p className="text-text-muted">
+                Views over the parsed repository index. Every row is resolved
+                from the parser and carries its own evidence label; text search
+                is never presented as a symbol relationship.
+              </p>
+              <ul className="space-y-1 text-xs text-text-muted list-disc pl-4">
+                <li>References — definition plus every location</li>
+                <li>Call hierarchy — DETERMINISTIC / HEURISTIC / UNSUPPORTED</li>
+                <li>Dependency graph — imports and exports, with provenance</li>
+                <li>Impact — direct, transitive, possible, unresolved</li>
+              </ul>
+              <p className="text-xs text-text-muted">
+                Pick a symbol or file in the main pane and run Analyze.
+              </p>
+            </div>
+          </Panel>
+        );
 
       case "missions":
         return (

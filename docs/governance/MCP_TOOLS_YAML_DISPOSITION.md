@@ -53,6 +53,12 @@ nothing, and `.gitignore` has no entry. It was simply never added.
 
 **The 3 missing:** `cargo.test`, `shell.echo`, `shell.execute`
 
+> **Note (2026-09-28).** The table above compares the 30-entry untracked file as it
+> stood when this disposition was written. Eight read-only repository-intelligence
+> executors (`nav.*`) have since been added to `get_real_tool`, so the factory now
+> provides **20** real executors and `mcp.tools.yaml` lists **20** ids under `tools:`.
+> The `proposed:` set below is unchanged at 21.
+
 ### 2.1 Two entries reference files that do not exist
 
 | id | command | reality |
@@ -118,7 +124,8 @@ defect reappearing in configuration form.
 Committed as `mcp.tools.yaml` at the repository root, derived from
 `Catalogue::canonical().executable_ids()`:
 
-* exactly the **12** ids that have a real executor;
+* exactly the **20** ids that have a real executor (12 general-purpose plus the 8
+  read-only `nav.*` repository-intelligence tools);
 * `command: "builtin"` throughout, because the executors are bound by id and no
   caller-supplied program is honoured — the field is present only because
   `McpToolConfig` requires it;

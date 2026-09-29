@@ -528,6 +528,22 @@ fn repo_intel_json(root: &std::path::Path, task: &str) -> serde_json::Value {
     })
 }
 
+/// Shared navigation handler: one engine (`zylcode-nav`), one process-wide
+/// index slot, three surfaces. Read-only.
+///
+/// Failures are reported as an `error` body rather than an answer, so a
+/// client can never mistake "the index could not be built" for "this symbol
+/// is not referenced anywhere".
+fn nav_json(root: &std::path::Path, tool: &str, args: serde_json::Value) -> serde_json::Value {
+    match zylcode_core::intelligence::nav_api::nav_payload(root, tool, args) {
+        Ok(value) => value,
+        Err(e) => serde_json::json!({
+            "error": format!("repository navigation failed: {e}"),
+            "engine": "zylcode-nav",
+        }),
+    }
+}
+
 async fn handle_serve_intel(workspace: &str, args: ServeIntelArgs) -> Result<()> {
     use axum::extract::State;
     use axum::routing::get;
@@ -1332,6 +1348,32 @@ async fn handle_serve_intel(workspace: &str, args: ServeIntelArgs) -> Result<()>
         }
     }
 
+    /// One repository-intelligence navigation query.
+    ///
+    /// `POST /api/nav` with `{"tool": "find_references", "args": {...}}`.
+    /// Read-only: it reads the parsed index and never writes anything except
+    /// the gitignored warm-start cache the index maintains.
+    async fn nav(
+        State(root): State<Arc<std::path::PathBuf>>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let tool = body
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let args = body
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let root = Arc::clone(&root);
+        let payload = tokio::task::spawn_blocking(move || nav_json(&root, &tool, args)).await;
+        match payload {
+            Ok(value) => Json(value),
+            Err(e) => Json(serde_json::json!({ "error": format!("nav task failed: {e}") })),
+        }
+    }
+
     // Terminal sessions: cwd state lives for the service's lifetime.
     // FromRef lets each handler extract only the field it needs.
     #[derive(Clone, axum::extract::FromRef)]
@@ -1348,6 +1390,7 @@ async fn handle_serve_intel(workspace: &str, args: ServeIntelArgs) -> Result<()>
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/repo-intel", get(repo_intel))
+        .route("/api/nav", axum::routing::post(nav))
         .route("/api/git/status", get(git_status))
         .route("/api/version", get(version))
         .route("/api/tools", get(tools))
@@ -1400,8 +1443,8 @@ async fn handle_serve_intel(workspace: &str, args: ServeIntelArgs) -> Result<()>
         root.display()
     );
     println!(
-        "endpoints: GET /healthz, GET /api/repo-intel?task=..., GET /api/git/status, \
-         GET /api/search?q=..., GET /api/files, GET /api/evidence"
+        "endpoints: GET /healthz, GET /api/repo-intel?task=..., POST /api/nav, \
+         GET /api/git/status, GET /api/search?q=..., GET /api/files, GET /api/evidence"
     );
     axum::serve(listener, app).await?;
     Ok(())

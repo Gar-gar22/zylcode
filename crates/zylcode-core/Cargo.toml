@@ -24,6 +24,7 @@ ahash = { workspace = true }
 lru = { workspace = true }
 memchr = { workspace = true }
 zylcode-mcp = { workspace = true }
+zylcode-nav = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 walkdir = "2"

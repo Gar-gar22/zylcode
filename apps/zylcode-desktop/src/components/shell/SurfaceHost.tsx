@@ -5,6 +5,7 @@ import { ExplorerTree } from "../ExplorerTree";
 import { LiveSearch } from "../LiveSearch";
 import { MissionComposer } from "../MissionComposer";
 import { RepoIntelPanel } from "../RepoIntelPanel";
+import { NavErrorBoundary, RepoNavPanel } from "../RepoNavPanel";
 import { SourceControlPanel } from "../SourceControlPanel";
 import { RuntimeLab } from "../RuntimeLab";
 import { TerminalPanel } from "../TerminalPanel";
@@ -52,6 +53,8 @@ interface SurfaceHostProps {
   applyPatch: any;
   closeTab: any;
   deltas: any[];
+  /** Click-to-navigate from a graph fact into the editor. */
+  onNavigateToFile: (path: string) => void;
 }
 
 export function SurfaceHost({
@@ -75,6 +78,7 @@ export function SurfaceHost({
   applyPatch,
   closeTab,
   deltas,
+  onNavigateToFile,
 }: SurfaceHostProps) {
   const renderSurface = () => {
     switch (surface) {
@@ -184,7 +188,10 @@ export function SurfaceHost({
 
       case "intel":
         return (
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 p-1">
+          <div className="space-y-3 p-1">
+            <NavErrorBoundary>
+            <RepoNavPanel onNavigateToFile={onNavigateToFile} />
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
             <RepoIntelPanel initialTask="agent loop and evidence ledger" />
             <div className="space-y-3">
               <Panel title="WHAT AM I LOOKING AT">
@@ -196,9 +203,14 @@ export function SurfaceHost({
                     content-hash-validated index (no per-keystroke re-indexing).
                   </p>
                   <p>
-                    Browser preview reaches it via <span className="font-mono">zylcode serve-intel</span>
-                    {" "}(HTTP); the desktop app calls the engine in-process. Ranking and provenance
-                    are the retriever's own output — nothing here is mocked.
+                    The navigation panel above reads the <span className="text-text">same</span>{" "}
+                    parsed index the <span className="font-mono">nav.*</span> agent tools read:
+                    symbols, references, callers and callees, import edges and impact classes,
+                    each row labelled <span className="font-mono">DETERMINISTIC</span>,{" "}
+                    <span className="font-mono">HEURISTIC</span> or{" "}
+                    <span className="font-mono">UNSUPPORTED</span> by the engine. Browser preview
+                    reaches it via <span className="font-mono">zylcode serve-intel</span> (HTTP);
+                    the desktop app calls the engine in-process. Nothing here is mocked.
                   </p>
                 </div>
               </Panel>
@@ -206,11 +218,14 @@ export function SurfaceHost({
                 <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs">
                   <span className="flex items-center gap-1.5">Missions <StatusBadge status="LIMITED" size="xs" /></span>
                   <span className="flex items-center gap-1.5">Repository Intelligence <StatusBadge status="AVAILABLE" size="xs" /></span>
+                  <span className="flex items-center gap-1.5">Code navigation <StatusBadge status="AVAILABLE" size="xs" /></span>
                   <span className="flex items-center gap-1.5">Forge <StatusBadge status="LIMITED" size="xs" /></span>
                   <span className="flex items-center gap-1.5">Design <StatusBadge status="COMING SOON" size="xs" /></span>
                 </div>
               </Panel>
             </div>
+            </div>
+            </NavErrorBoundary>
           </div>
         );
 

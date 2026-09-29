@@ -82,7 +82,19 @@ impl PersistedIndex {
     /// measured one is deserialized and served. Slow path: full re-index,
     /// then write-through. A corrupted or foreign-schema cache is discarded,
     /// never trusted.
+    ///
+    /// # Fail closed on a missing root
+    ///
+    /// `store()` creates `<root>/.zylcode/…` with `create_dir_all`. On a
+    /// workspace root that does not exist, that write would bring the missing
+    /// directory (and its parent chain) into existence as a *warm-start side
+    /// effect*, after which downstream consumers — `RepoIndex::build`, whose
+    /// guard is `ensure!(root.is_dir())` — would see a real, empty directory
+    /// and report an empty graph instead of the input error. The input error
+    /// is the signal; it must not be laundered into "indexed, nothing there".
+    /// So the root is validated before any fingerprinting or writing.
     pub fn build(&self) -> Result<RepoQuery> {
+        self.ensure_root_exists()?;
         let fingerprint = self.measure_fingerprint()?;
 
         if let Some(cached) = self.load_if_fresh(&fingerprint) {
@@ -98,12 +110,32 @@ impl PersistedIndex {
 
     /// Force a full re-index and refresh the cache, ignoring any existing
     /// cache file. Used when a consumer knows the repository changed.
+    ///
+    /// Fails closed on a missing root for the same reason as [`build`].
     pub fn rebuild(&self) -> Result<RepoQuery> {
+        self.ensure_root_exists()?;
         let query = crate::intelligence::query::build_repo_query(&self.root)?;
         let fingerprint = self.measure_fingerprint()?;
         let cached = Self::from_query(&query, fingerprint);
         self.store(&cached)?;
         Ok(query)
+    }
+
+    /// Reject a workspace root that is not a real directory before any work
+    /// (or any `create_dir_all`) happens.
+    ///
+    /// Without this, `store()`'s `create_dir_all(<root>/.zylcode)` is the
+    /// *first* thing that touches a missing root: it materialises the missing
+    /// directory as a side effect of an index warm-start, and the caller's
+    /// "your workspace does not exist" error is converted into a silent empty
+    /// result. See [`build`].
+    fn ensure_root_exists(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.root.is_dir(),
+            "workspace root '{}' does not exist (refusing to index a missing directory)",
+            self.root.display()
+        );
+        Ok(())
     }
 
     /// SHA-256 over the sorted (relative path, content hash) inventory.
@@ -290,6 +322,58 @@ mod tests {
         assert!(
             fs::read(idx.cache_path()).unwrap().len() > 100,
             "the rebuilt cache must be written back"
+        );
+    }
+
+    /// G6: a warm-start must never bring a missing workspace root into
+    /// existence. `store()` writes `<root>/.zylcode/intelligence-index.json`
+    /// with `create_dir_all`, so without an entry guard the *first* thing that
+    /// touches a missing root is that write — the directory appears as a side
+    /// effect, and `RepoIndex::build`'s `ensure!(root.is_dir())` then passes
+    /// against the empty directory the index itself just created. The
+    /// caller's "your workspace does not exist" error must survive instead.
+    #[test]
+    fn build_on_a_missing_root_fails_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-workspace");
+        let idx = isolated(&missing);
+
+        let err = match idx.build() {
+            Ok(_) => panic!("a missing root must fail closed"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not exist"),
+            "the error must name the input problem, got: {msg}"
+        );
+        assert!(
+            !missing.exists(),
+            "an index warm-start must not materialise a missing workspace root"
+        );
+        assert!(
+            !idx.cache_path().exists(),
+            "no cache may be written for a root that never existed"
+        );
+    }
+
+    #[test]
+    fn rebuild_on_a_missing_root_fails_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-workspace");
+        let idx = isolated(&missing);
+
+        let err = match idx.rebuild() {
+            Ok(_) => panic!("a missing root must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "the error must name the input problem"
+        );
+        assert!(
+            !missing.exists(),
+            "rebuild must not materialise a missing workspace root either"
         );
     }
 }

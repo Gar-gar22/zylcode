@@ -81,6 +81,7 @@ const ACTIVITY_TO_SURFACE: Record<ActivityId, SurfaceType> = {
   explorer: "code",
   search: "search",
   "source-control": "source-control",
+  intel: "intel",
   missions: "missions",
   run: "runtime",
   evidence: "evidence-live",
@@ -291,6 +292,20 @@ function AppContent() {
     setEditorActive(path);
   }, [setEditorTabs, setEditorActive]);
 
+  /**
+   * Click-to-navigate target for repository-intelligence surfaces: open the
+   * file *and* bring the editor forward, because a reference row is useless
+   * if it opens a tab nobody can see.
+   */
+  const navigateToFile = useCallback(
+    (path: string) => {
+      openFile(path);
+      setActiveActivity("explorer");
+      setActiveSurface("code");
+    },
+    [openFile],
+  );
+
   const closeEditorTab = useCallback(
     (path: string) => {
       setEditorTabs((prev) => {
@@ -383,6 +398,7 @@ function AppContent() {
           { id: "view-explorer", label: "Explorer", shortcut: "Ctrl+Shift+E", run: () => handleActivityChange("explorer") },
           { id: "view-search", label: "Search", shortcut: "Ctrl+Shift+F", run: () => handleActivityChange("search") },
           { id: "view-scm", label: "Source Control", shortcut: "Ctrl+Shift+G", run: () => handleActivityChange("source-control") },
+          { id: "view-intel", label: "Code Navigation", run: () => handleActivityChange("intel") },
           { id: "view-terminal", label: "Toggle Terminal Panel", shortcut: "Ctrl+`", run: () => setBottomPanelOpen((v) => !v) },
           { id: "view-problems", label: "Problems", run: () => { setBottomPanelOpen(true); setActiveBottomTab("problems"); } },
           { id: "view-output", label: "Output", run: () => { setBottomPanelOpen(true); setActiveBottomTab("output"); } },
@@ -566,6 +582,7 @@ function AppContent() {
                 applyPatch={applyPatch}
                 closeTab={closeTab}
                 deltas={deltas}
+                onNavigateToFile={navigateToFile}
               />
             </div>
           )}

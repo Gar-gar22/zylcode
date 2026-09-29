@@ -220,6 +220,29 @@ async fn repo_context(
     .await
     .map_err(|e| format!("intel task failed: {e}"))?
 }
+
+/// Repository-intelligence navigation: the same `zylcode-nav` engine and the
+/// same process-wide index slot as the `serve-intel` `POST /api/nav` route
+/// and the `nav.*` MCP tools, so every surface answers from one index.
+///
+/// Read-only. An unresolvable selector arrives *inside* a successful payload
+/// with `unresolved` set — never as an invented hit — while a failure to run
+/// the query arrives as `Err`, so a UI cannot render an error as an answer.
+#[tauri::command]
+async fn nav_query(
+    tool: String,
+    args: Option<serde_json::Value>,
+    state: tauri::State<'_, EngineState>,
+) -> Result<serde_json::Value, String> {
+    let root = std::path::PathBuf::from(&state.engine.config().workspace_root);
+    let args = args.unwrap_or_else(|| serde_json::json!({}));
+    tokio::task::spawn_blocking(move || {
+        zylcode_core::intelligence::nav_api::nav_payload(&root, &tool, args)
+            .map_err(|e| format!("repository navigation failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("nav task failed: {e}"))?
+}
 /// Mission queue: append a task (build or plan mode).
 #[tauri::command]
 async fn mission_enqueue(
@@ -1218,6 +1241,7 @@ fn main() {
             process_intent_stream,
             preview_execution_plan,
             repo_context,
+            nav_query,
             git_status,
             terminal_exec,
             mission_enqueue,

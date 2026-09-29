@@ -68,6 +68,15 @@ pub struct AgentContext {
     pub current_state: String,
     pub git_status: Option<String>,
     pub errors: Vec<String>,
+    /// Deterministic repository-graph evidence gathered for `user_goal` —
+    /// declarations and references produced by `zylcode-nav`, each line
+    /// carrying its own evidence grade.
+    ///
+    /// Empty means *nothing was looked up*, never *nothing exists*; callers
+    /// that cannot gather it must say so explicitly rather than pass an empty
+    /// list, because an empty list reads to a model as "no relationships".
+    #[serde(default)]
+    pub navigation_citations: Vec<String>,
 }
 
 /// Result of tool execution returned to model

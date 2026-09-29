@@ -34,6 +34,20 @@ impl ContextBuilder {
         };
         let git_status = self.get_git_status().await.ok();
 
+        // Deterministic repository-graph evidence for the goal: declarations
+        // and references resolved through `zylcode-nav`, never inferred. An
+        // index that cannot be built produces an explicit "unavailable" line
+        // rather than an empty list — an empty list reads to a model as "no
+        // relationships exist", which is exactly the claim this wave forbids.
+        let navigation_citations =
+            match crate::intelligence::nav_api::agent_citation_block(&self.workspace_root, user_goal, 12)
+            {
+                Ok(lines) => lines,
+                Err(e) => vec![format!(
+                    "(repository graph unavailable: {e} — treat every structural claim as interpretation)"
+                )],
+            };
+
         Ok(AgentContext {
             workspace_root: self.workspace_root.to_string_lossy().to_string(),
             file_tree,
@@ -44,6 +58,7 @@ impl ContextBuilder {
             current_state: "Created".to_string(),
             git_status,
             errors: Vec::new(),
+            navigation_citations,
         })
     }
 
@@ -220,6 +235,138 @@ mod intelligence_integration_tests {
             ctx.relevant_files.iter().any(|f| f.contains("agent.rs")),
             "co-change evidence must surface agent.rs; got {:?}",
             ctx.relevant_files
+        );
+    }
+
+    /// The AI-integration half of the wave: an agent's gathered context must
+    /// carry repository-graph evidence it can quote, and every line in it must
+    /// be deterministic — an `HEURISTIC` citation would let a model present a
+    /// guess as a graph fact.
+    #[tokio::test]
+    async fn agent_context_carries_deterministic_graph_citations() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod helper;\n\npub fn entry() {\n    helper::run();\n}\n",
+        )
+        .expect("lib");
+        std::fs::write(
+            root.join("src/helper.rs"),
+            "pub fn run() -> u32 {\n    1\n}\n",
+        )
+        .expect("helper");
+
+        let builder = ContextBuilder::new(root.to_path_buf());
+        let ctx = builder
+            .build("which files call run from entry", &[])
+            .await
+            .expect("context build");
+
+        assert!(
+            !ctx.navigation_citations.is_empty(),
+            "the goal names a real symbol, so the context must carry graph evidence: {:?}",
+            ctx.navigation_citations
+        );
+        assert!(
+            ctx.navigation_citations
+                .iter()
+                .all(|line| line.starts_with("DETERMINISTIC")),
+            "an agent may only ever quote deterministic evidence: {:?}",
+            ctx.navigation_citations
+        );
+        assert!(
+            ctx.navigation_citations
+                .iter()
+                .any(|line| line.contains("run")),
+            "the cited symbol's own name must be quotable: {:?}",
+            ctx.navigation_citations
+        );
+        assert!(
+            ctx.navigation_citations
+                .iter()
+                .any(|line| line.contains("src/helper.rs:")),
+            "every citation must be a location: {:?}",
+            ctx.navigation_citations
+        );
+    }
+
+    /// A workspace the index cannot read must say so in the context rather
+    /// than passing an empty list — an empty list reads to a model as "no
+    /// relationships exist".
+    ///
+    /// The root is a *file*, not a missing path: the Repository Intelligence
+    /// warm-start writes `<root>/.zylcode/…`, and `create_dir_all` on that
+    /// path silently brings a non-existent workspace root into existence
+    /// before the navigation index ever sees it. A file cannot be turned into
+    /// a directory, so `RepoIndex::build` refuses it for real.
+    #[tokio::test]
+    async fn an_unindexable_workspace_says_the_graph_is_unavailable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let not_a_directory = dir.path().join("workspace.txt");
+        std::fs::write(&not_a_directory, "not a workspace\n").expect("file root");
+        let builder = ContextBuilder::new(not_a_directory);
+        let ctx = builder
+            .build("do anything", &[])
+            .await
+            .expect("context build must still succeed");
+
+        assert_eq!(
+            ctx.navigation_citations.len(),
+            1,
+            "{:?}",
+            ctx.navigation_citations
+        );
+        assert!(
+            ctx.navigation_citations[0].contains("repository graph unavailable"),
+            "{}",
+            ctx.navigation_citations[0]
+        );
+        assert!(
+            ctx.navigation_citations[0].contains("interpretation"),
+            "the line must tell the model to label structural claims as interpretation: {}",
+            ctx.navigation_citations[0]
+        );
+    }
+
+    /// G6, end to end: the warm-start index sits *before* the citation block
+    /// on this path, so a missing workspace root used to be created by
+    /// `create_dir_all(<root>/.zylcode)` and the nav guard then passed against
+    /// the empty directory that write had just produced. Both halves must now
+    /// fail closed: the context still builds (the agent must not die), but the
+    /// citations say the graph is unavailable and the root stays missing.
+    #[tokio::test]
+    async fn a_missing_workspace_root_is_never_created_by_a_warm_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("no-such-workspace");
+        assert!(!missing.exists());
+
+        let builder = ContextBuilder::new(missing.clone());
+        let ctx = builder
+            .build("anything", &[])
+            .await
+            .expect("context build must still succeed");
+
+        assert_eq!(
+            ctx.navigation_citations.len(),
+            1,
+            "{:?}",
+            ctx.navigation_citations
+        );
+        assert!(
+            ctx.navigation_citations[0].contains("repository graph unavailable"),
+            "{}",
+            ctx.navigation_citations[0]
+        );
+        assert!(
+            !missing.exists(),
+            "indexing must not bring a missing workspace root into existence"
         );
     }
 }

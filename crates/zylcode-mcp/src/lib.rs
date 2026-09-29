@@ -9,6 +9,7 @@ pub mod enhanced_skills;
 pub mod evidence;
 pub mod executor;
 pub mod hot_reload;
+pub mod nav_tools;
 pub mod permission;
 pub mod plugin_marketplace;
 pub mod real_tools;
@@ -34,6 +35,7 @@ pub use executor::{execute_with_recovery, ExecuteOptions};
 pub use hot_reload::{
     AnalyticsReport, HotReloadConfig, HotReloadManager, ReloadCallback, ToolAnalytics,
 };
+pub use nav_tools::{is_nav_tool, payload_id, NavTool};
 pub use permission::{PermissionDecision, PermissionGate, PermissionPolicy};
 pub use plugin_marketplace::{InstalledPlugin, PluginDefinition, PluginMarketplace, UIComponent};
 pub use real_tools::{

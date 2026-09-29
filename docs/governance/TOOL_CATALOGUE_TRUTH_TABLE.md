@@ -208,10 +208,10 @@ unsupported claim: the development category contains **11** tools.
 
 ---
 
-## 3. System B truth table — 12 real executors
+## 3. System B truth table — 20 real executors
 
-Factory: `crates/zylcode-mcp/src/real_tools.rs:775` `pub fn get_real_tool(tool_id)`.
-Dispatch: `crates/zylcode-mcp/src/tool.rs:71` inside `DynamicTool::call`.
+Factory: `crates/zylcode-mcp/src/real_tools.rs` `pub fn get_real_tool(tool_id)`.
+Dispatch: `crates/zylcode-mcp/src/tool.rs` `DynamicTool::call` → `real_tools::dispatch`.
 
 | # | tool_id | executor | executes | mechanism | registered by | test | rung | status |
 |---|---|---|---|---|---|---|---|---|
@@ -227,12 +227,25 @@ Dispatch: `crates/zylcode-mcp/src/tool.rs:71` inside `DynamicTool::call`.
 | 10 | git.commit | `GitTool` | yes | `git <subcommand>` subprocess | `zylcode-core` | — | R1 | REAL |
 | 11 | search.find | `SearchTool` | yes | real glob search | `zylcode-core` | — | R1 | REAL |
 | 12 | search.grep | `SearchTool` | yes | real content grep | `zylcode-core` | — | R1 | REAL |
+| 13 | nav.find_definition | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 14 | nav.find_references | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 15 | nav.find_callers | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 16 | nav.find_callees | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 17 | nav.file_dependencies | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 18 | nav.file_dependents | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 19 | nav.symbol_impact | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
+| 20 | nav.repository_graph_query | `NavTool` | yes | `zylcode-nav` index lookup | `zylcode-mcp` | `tests/nav_tools.rs` | **R2** | REAL |
 
-`GitTool::execute` (`real_tools.rs:482`) spawns `Command::new("git").arg(subcommand)
+`GitTool::execute` (`real_tools.rs`) spawns `Command::new("git").arg(subcommand)
 .args(args)` and returns the real `stdout`, `stderr` and `exit_code`. `ShellTool` and
 `FileSystemTool` are of the same character. These are genuine executors.
 
-**System B summary: 12 REAL, of which 2 reach R2 (EXECUTED by a committed test).**
+`NavTool` does not spawn anything: it answers from the in-memory repository index built
+by `crates/zylcode-nav`, reusing the previous build for the same root for one second so
+that no query re-indexes the repository. Its only write is the gitignored warm-start
+cache at `<root>/.zylcode/nav-index.json`.
+
+**System B summary: 20 REAL, of which 10 reach R2 (EXECUTED by a committed test).**
 
 ### 3.1 Impedance mismatch — tool id vs. executed command
 
@@ -251,11 +264,12 @@ enforcement and the catalogue cannot be used as an allow-list without additional
 | `npm.install` | yes | **no** | defined, never executable |
 | `npm.run` | **no** | yes | executable, not defined |
 | `fs.*`, `shell.*`, `search.*`, `cargo.test` | **no** | yes | executable, not defined |
+| `nav.*` (8 repository-intelligence ids) | **no** | yes | executable, not defined |
 
-The bridge defines 27 tools that cannot execute. The factory implements 12 tools that the
-bridge never defines. The two sets intersect on only three ids (`git.commit`,
-`git.status` is absent from the bridge, `git.diff` absent). Effectively: **the catalogue
-and the executor are disjoint.**
+The bridge defines 27 tools that cannot execute. The factory implements 20 tools that the
+bridge never defines; the two sets intersect on exactly one id (`git.commit`), which is
+what makes `definition_count` = `20 + 27 − 1` = 46. Effectively: **the catalogue and the
+executor are disjoint.**
 
 ---
 
@@ -264,7 +278,7 @@ and the executor are disjoint.**
 | Path | Reachable from `apps/zylcode-desktop`? | Evidence |
 |---|---|---|
 | `EnhancedMcpBridge` (27 definitions) | **NO** | `grep -rn EnhancedMcpBridge crates/ apps/` → 0 hits outside `crates/zylcode-mcp/` |
-| `DynamicTool` → `get_real_tool` (12 executors) | **YES, in principle** | `zylcode-core/src/agent.rs:1584,1625,1668`; `zylcode-core/src/lib.rs:458` |
+| `DynamicTool` → `get_real_tool` (20 executors) | **YES, in principle** | `zylcode-core/src/agent.rs:1584,1625,1668`; `zylcode-core/src/lib.rs:458` |
 
 Two qualifications on the System B reachability claim:
 
@@ -559,10 +573,10 @@ closed; bindings are declared and enforced; the shipped config equals the execut
 
 | Metric | Value |
 |---|---|
-| `definition_count` | **38** (12 executable + 27 bridge definitions − 1 overlap, `git.commit`) |
-| `executable_count` | **12** |
-| `tested_execution_count` | 2 (`fs.read`, `shell.execute`) |
-| `product_reachable_count` | 11 (`git.commit` is false) |
+| `definition_count` | **46** (20 executable + 27 bridge definitions − 1 overlap, `git.commit`) |
+| `executable_count` | **20** (12 general-purpose + 8 repository-intelligence `nav.*`) |
+| `tested_execution_count` | 10 (`fs.read`, `shell.execute`, and the 8 `nav.*` tools via `crates/zylcode-mcp/tests/nav_tools.rs`) |
+| `product_reachable_count` | 19 (`git.commit` is false) |
 | `r3_verified_count` | **0** |
 
 These figures are pinned by

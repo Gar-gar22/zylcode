@@ -73,6 +73,8 @@ impl ToolRegistry {
                     id if id.starts_with("shell.") => RiskLevel::Execute,
                     id if id.starts_with("git.") => RiskLevel::GitWrite,
                     id if id.starts_with("search.") => RiskLevel::Read,
+                    // Repository intelligence: read-only queries over the index.
+                    id if id.starts_with("nav.") => RiskLevel::Read,
                     _ => RiskLevel::Execute,
                 };
 

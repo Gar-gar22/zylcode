@@ -5,6 +5,7 @@ export type ActivityId =
   | "explorer"
   | "search"
   | "source-control"
+  | "intel"
   | "missions"
   | "run"
   | "evidence"
@@ -56,6 +57,25 @@ const ACTIVITIES: Activity[] = [
         <circle cx="6" cy="6" r="3"></circle>
         <path d="M13 6h3a2 2 0 0 1 2 2v7"></path>
         <path d="M11 18H8a2 2 0 0 1-2-2V9"></path>
+      </svg>
+    ),
+  },
+  {
+    // The `intel` surface hosts the deterministic navigation views (references,
+    // call hierarchy, dependency graph, impact) above the repository-intelligence
+    // grid. It existed before this wave but had no entry point at all, so the
+    // surface — and everything rendered on it — was unreachable from the shell.
+    id: "intel",
+    label: "Code Navigation",
+    status: "available",
+    icon: (
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="6" cy="6" r="3"></circle>
+        <circle cx="18" cy="6" r="3"></circle>
+        <circle cx="12" cy="18" r="3"></circle>
+        <path d="M8.6 7.5l2.5 7.6"></path>
+        <path d="M15.4 7.5l-2.5 7.6"></path>
+        <path d="M9 6h6"></path>
       </svg>
     ),
   },

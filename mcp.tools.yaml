@@ -102,6 +102,58 @@ tools:
     enabled: true
     description: "Execute an arbitrary program. Unbound escape hatch; requires the strongest permission gate."
 
+  # ------------------------------------------------ repository intelligence
+  # Read-only queries against the deterministic repository index maintained by
+  # zylcode-nav. They never search text and never infer: an unresolvable
+  # selector comes back as `unresolved`, not as an invented answer.
+  - id: "nav.find_definition"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Resolve a symbol to its declaration (name, kind, file, line, range, container, signature)"
+
+  - id: "nav.find_references"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Find every reference to a symbol, each labelled by evidence; never fabricated"
+
+  - id: "nav.find_callers"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Find what calls a symbol; every relation labelled deterministic, heuristic or unsupported"
+
+  - id: "nav.find_callees"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Find what a symbol calls; every relation labelled deterministic, heuristic or unsupported"
+
+  - id: "nav.file_dependencies"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Outgoing dependency edges of a file, each with provenance"
+
+  - id: "nav.file_dependents"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Incoming dependency edges of a file, each with provenance"
+
+  - id: "nav.symbol_impact"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Relationships a change could reach (direct, transitive, possible textual, unresolved) — relationships, not predictions"
+
+  - id: "nav.repository_graph_query"
+    command: "builtin"
+    transport: "stdio"
+    enabled: true
+    description: "Query the repository graph with kind, focus, depth and cycle filtering"
+
 # ---------------------------------------------------------------------------
 # NOT LOADED. Definitions preserved for their parameter schemas.
 #
