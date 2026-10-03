@@ -6,7 +6,6 @@ use std::collections::HashMap;
 
 use crate::config::McpToolConfig;
 use crate::real_tools::ToolContext;
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +99,9 @@ impl Tool for DynamicTool {
         //      `Ok(json!({"status": "failed"}))`. A failure reported as `Ok` is
         //      the same defect with a different label.
         let context = ToolContext {
-            working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            // The workspace the loop is bound to, else the process CWD. See
+            // `crate::workspace` for why this is not simply `current_dir()`.
+            working_directory: crate::workspace::tool_working_directory(),
             environment: std::env::vars().collect(),
             timeout: Duration::from_secs(30),
             session_id: None,

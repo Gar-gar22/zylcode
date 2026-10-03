@@ -316,6 +316,18 @@ impl ZylCodeEngine {
         let ledger_path = format!("{}/ledger.db", ledger_dir);
         let ledger = Arc::new(crate::sqlite_ledger::SqliteLedgerStore::new(&ledger_path)?);
 
+        // TOOL-01: the loop resolves tools only through this registry and it
+        // starts empty, so fill it in *before* the loop is constructed. See
+        // `Self::ensure_executable_tools` for why the invariant lives here.
+        let added_tools = self.ensure_executable_tools().await;
+        if !added_tools.is_empty() {
+            info!(
+                count = added_tools.len(),
+                tools = %added_tools.join(","),
+                "registered executable built-in tools"
+            );
+        }
+
         let mut agent = agent::AgentLoop::new(
             &intent.prompt,
             workspace_root,
@@ -477,6 +489,33 @@ impl ZylCodeEngine {
     /// Register tools from a local config file (`mcp.tools.yaml`).
     pub async fn load_tools_from_config(&self, path: &std::path::Path) -> Result<usize> {
         zylcode_mcp::register_from_config_file(&self.tool_registry, path).await
+    }
+
+    /// Register every catalogue-executable built-in the agent's tool registry
+    /// is missing, and report which ids had to be added.
+    ///
+    /// # Why this sits here rather than in one front-end's `main()`
+    ///
+    /// [`agent::AgentLoop::execute_tool_call`] resolves tools **only** through
+    /// the registry it is constructed with, and `ZylCodeEngine` constructs that
+    /// registry empty — the defect recorded as **TOOL-01** in
+    /// `docs/governance/REPOSITORY_INTELLIGENCE_WAVE_2026-09-28.md` §17.1. The
+    /// desktop shell fills it from `mcp.tools.yaml` at startup; the CLI never
+    /// did, so the first tool step of a real CLI turn ended in
+    /// `Tool not found: fs.read` and the run exited 1.
+    ///
+    /// Anchoring the invariant at the single entry point that builds the loop
+    /// means every caller of [`Self::process_intent`] — CLI, desktop, tests —
+    /// gets the same registry, and a `clear()` performed by the config
+    /// hot-reload watcher cannot leave the next run unregistered. It runs
+    /// before `AgentLoop::new`, so the loop never observes a registry missing
+    /// an executable id.
+    ///
+    /// Ids already present are left untouched (see
+    /// [`zylcode_mcp::register_executable_builtins`]), so a tool registered
+    /// from `mcp.tools.yaml` or by a test keeps its own descriptor and runtime.
+    pub async fn ensure_executable_tools(&self) -> Vec<String> {
+        zylcode_mcp::register_executable_builtins(&self.tool_registry).await
     }
 
     /// Hot-reload tools on config file change (requires `notify`).
@@ -672,5 +711,78 @@ mod tests {
         let bridges = engine.list_mcp_bridges().await;
         assert_eq!(bridges.len(), 1);
         assert_eq!(bridges[0].id, "bridge-a");
+    }
+
+    /// **TOOL-01** — the invariant `process_intent` now establishes before it
+    /// builds the agent loop.
+    ///
+    /// The engine's registry is the *only* table `AgentLoop::execute_tool_call`
+    /// consults, and it starts empty. `ensure_executable_tools` has to fill it
+    /// with exactly the ids that have real executors — not a hardcoded list,
+    /// and not a set of definition-only entries the loop could never run.
+    #[tokio::test]
+    async fn ensure_executable_tools_fills_the_registry_with_executable_ids() {
+        let engine = ZylCodeEngine::with_defaults();
+        assert!(
+            engine.tool_registry().is_empty().await,
+            "the engine must start with an empty registry, or this test proves nothing"
+        );
+
+        let added = engine.ensure_executable_tools().await;
+        assert!(
+            added.contains(&"fs.read".to_string()),
+            "`fs.read` is the id the plan template's own example step names"
+        );
+
+        for id in zylcode_mcp::Catalogue::canonical().executable_ids() {
+            assert!(
+                engine.tool_registry().get(id).await.is_some(),
+                "{id} must be reachable from the registry the loop is built over"
+            );
+            assert!(
+                zylcode_mcp::get_real_tool(id).is_some(),
+                "{id} has no executor — a definition-only id must never be registered"
+            );
+        }
+
+        // Fill-in only, and idempotent: a second pass adds nothing, and an id
+        // the caller configured first keeps its own descriptor.
+        assert!(
+            engine.ensure_executable_tools().await.is_empty(),
+            "a second pass must add nothing"
+        );
+    }
+
+    /// The wiring, not just the helper: `process_intent` is the single entry
+    /// point that builds the agent loop, and it must fill the registry *before*
+    /// it does. Testing `ensure_executable_tools` alone would leave the call
+    /// site unguarded — a helper nobody invokes is not a fix.
+    #[tokio::test]
+    async fn process_intent_fills_the_registry_before_building_the_loop() {
+        let engine = ZylCodeEngine::with_defaults();
+        assert!(
+            engine.tool_registry().is_empty().await,
+            "precondition: the engine starts with an empty registry"
+        );
+
+        // The outcome of the run is not what is under test here — the model may
+        // be unreachable in this environment. What must hold either way is that
+        // the registry the loop was constructed over is no longer empty.
+        let _ = engine
+            .process_intent(Intent {
+                prompt: "build the project".to_string(),
+                context: None,
+                correlation_id: None,
+            })
+            .await;
+
+        assert!(
+            engine.tool_registry().get("fs.read").await.is_some(),
+            "`process_intent` must fill the registry before it builds the loop"
+        );
+        assert!(
+            !engine.tool_registry().is_empty().await,
+            "the registry must not be empty after a run"
+        );
     }
 }

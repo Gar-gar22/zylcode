@@ -20,10 +20,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 /// Typed failure modes for tool dispatch.
@@ -216,6 +217,136 @@ impl FileSystemTool {
     }
 }
 
+/// Hard ceiling on a single `fs.read`, in bytes (1 MiB).
+///
+/// The bound is enforced **at read time**: [`read_bounded`] takes
+/// `FS_READ_MAX_BYTES + 1` bytes and refuses the file when more came back.
+/// Checking `metadata().len()` first would trust a value a racing or sparse
+/// file can change underneath, and truncating would hand the caller a partial
+/// file labelled as a complete one — a success reported for work that was not
+/// performed, which `TOOL_CATALOGUE_TRUTH_TABLE.md` §1.1 forbids.
+pub const FS_READ_MAX_BYTES: u64 = 1_048_576;
+
+/// Why a bounded read stopped, before any bytes were handed back.
+#[derive(Debug)]
+pub enum ReadRefusal {
+    /// The file is larger than [`FS_READ_MAX_BYTES`]. Nothing was returned.
+    Oversized { limit: u64 },
+    /// The OS refused the read (missing file, permissions, ...).
+    Io(std::io::Error),
+    /// The bytes are not UTF-8, so there is no string to return.
+    NonUtf8 { valid_up_to: usize },
+}
+
+/// Read at most [`FS_READ_MAX_BYTES`] bytes of `path` as UTF-8.
+async fn read_bounded(path: &Path) -> Result<String, ReadRefusal> {
+    let file = fs::File::open(path).await.map_err(ReadRefusal::Io)?;
+    let mut buf = Vec::new();
+    file.take(FS_READ_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(ReadRefusal::Io)?;
+
+    if buf.len() as u64 > FS_READ_MAX_BYTES {
+        return Err(ReadRefusal::Oversized {
+            limit: FS_READ_MAX_BYTES,
+        });
+    }
+
+    String::from_utf8(buf).map_err(|e| ReadRefusal::NonUtf8 {
+        valid_up_to: e.utf8_error().valid_up_to(),
+    })
+}
+
+/// Resolve `requested` against the workspace `root`, refusing anything that
+/// leaves it.
+///
+/// This is the containment half of `TOOL-01`. Before it existed,
+/// `FileSystemTool::execute` did `working_directory.join(path)` and read the
+/// result, so `../`, an absolute path, and a symlink pointing out of the
+/// workspace were all honoured — `fs.read` could read anywhere the process
+/// could.
+///
+/// Rules, in order:
+///
+/// 1. A `..` component is refused on sight. The tool's contract is
+///    "relative to the workspace"; a parent hop is not part of that contract,
+///    so it is rejected rather than normalised and re-tested.
+/// 2. The root itself must resolve. If the workspace does not exist there is
+///    nothing to contain against, and falling back to the process CWD would
+///    silently retarget containment at the wrong directory.
+/// 3. The candidate is canonicalised, which follows symlinks, and must sit
+///    under the canonical root. An absolute `requested` replaces the root
+///    during the join; this check is what catches it.
+/// 4. When the target does not exist yet (a not-yet-created `fs.write`
+///    target, or a `fs.read` of a missing file), the deepest *existing*
+///    ancestor is what has to be inside the root. The read that follows still
+///    has to succeed on its own merits; containment only decides whether the
+///    attempt is even allowed.
+///
+/// A refusal is a typed [`ToolError::InvalidRequest`], so `dispatch` records
+/// it as evidence instead of dropping it.
+fn resolve_within(
+    tool_id: &str,
+    root: &Path,
+    requested: &str,
+) -> std::result::Result<PathBuf, ToolError> {
+    let refused = |reason: String| ToolError::InvalidRequest {
+        tool_id: tool_id.to_string(),
+        reason,
+    };
+
+    let req = Path::new(requested);
+    if req.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(refused(format!(
+            "path `{requested}` contains a `..` component; paths are resolved inside the workspace"
+        )));
+    }
+
+    let canon_root = root.canonicalize().map_err(|e| {
+        refused(format!(
+            "workspace root `{}` cannot be resolved: {e}",
+            root.display()
+        ))
+    })?;
+
+    // `join` lets an absolute `requested` replace the root outright. The
+    // containment test on the canonicalised result is what refuses that.
+    let candidate = canon_root.join(req);
+
+    match candidate.canonicalize() {
+        Ok(canon) if canon.starts_with(&canon_root) => Ok(canon),
+        Ok(canon) => Err(refused(format!(
+            "path `{}` resolves outside the workspace `{}`",
+            canon.display(),
+            canon_root.display()
+        ))),
+        // Not on disk yet. Walk to the deepest existing ancestor and contain
+        // *that*; the remainder of the path cannot lead anywhere by itself.
+        Err(_) => {
+            let mut ancestor: &Path = &candidate;
+            while !ancestor.exists() {
+                match ancestor.parent() {
+                    Some(parent) if parent != ancestor => ancestor = parent,
+                    _ => break,
+                }
+            }
+            match ancestor.canonicalize() {
+                Ok(canon) if canon.starts_with(&canon_root) => Ok(candidate),
+                Ok(canon) => Err(refused(format!(
+                    "path `{}` resolves outside the workspace `{}`",
+                    canon.display(),
+                    canon_root.display()
+                ))),
+                Err(e) => Err(refused(format!(
+                    "path `{}` cannot be resolved inside the workspace: {e}",
+                    candidate.display()
+                ))),
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl RealTool for FileSystemTool {
     fn id(&self) -> &str {
@@ -267,7 +398,13 @@ impl RealTool for FileSystemTool {
 
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        let full_path = context.working_directory.join(path);
+        // Containment runs *before* any I/O: a path outside the workspace is
+        // refused, never opened and then checked afterwards. `resolve_within`
+        // also canonicalises, so what follows cannot be re-aimed by a symlink.
+        let full_path = match resolve_within(&self.id, &context.working_directory, path) {
+            Ok(resolved) => resolved,
+            Err(e) => return Err(e.into()),
+        };
 
         let mut evidence = ToolEvidence::begin(
             &self.id,
@@ -278,7 +415,7 @@ impl RealTool for FileSystemTool {
         );
 
         let result = match action {
-            "read" => match fs::read_to_string(&full_path).await {
+            "read" => match read_bounded(&full_path).await {
                 Ok(content) => {
                     evidence.stdout = Some(content.clone());
                     ToolResult {
@@ -294,7 +431,37 @@ impl RealTool for FileSystemTool {
                         duration: start.elapsed(),
                     }
                 }
-                Err(e) => {
+                // Over the bound is a refusal, never a truncated success:
+                // no content was returned, so nothing may be recorded as read.
+                Err(ReadRefusal::Oversized { limit }) => {
+                    return Err(ToolError::InvalidRequest {
+                        tool_id: self.id.clone(),
+                        reason: format!(
+                            "`{path}` exceeds the {limit}-byte `fs.read` limit; no content was returned"
+                        ),
+                    }
+                    .into());
+                }
+                Err(ReadRefusal::NonUtf8 { valid_up_to }) => {
+                    let error = format!(
+                        "file is not valid UTF-8 (first invalid byte at offset {valid_up_to})"
+                    );
+                    evidence.stderr = Some(error.clone());
+                    evidence.exit_status = Some(1);
+                    ToolResult {
+                        success: false,
+                        output: serde_json::json!({
+                            "action": "read",
+                            "path": path,
+                            "error": error,
+                            "error_kind": "non_utf8"
+                        }),
+                        evidence: evidence.clone(),
+                        changed_files: Vec::new(),
+                        duration: start.elapsed(),
+                    }
+                }
+                Err(ReadRefusal::Io(e)) => {
                     evidence.stderr = Some(e.to_string());
                     evidence.exit_status = Some(1);
                     ToolResult {
@@ -302,7 +469,8 @@ impl RealTool for FileSystemTool {
                         output: serde_json::json!({
                             "action": "read",
                             "path": path,
-                            "error": e.to_string()
+                            "error": e.to_string(),
+                            "error_kind": "io"
                         }),
                         evidence: evidence.clone(),
                         changed_files: Vec::new(),
@@ -1260,6 +1428,14 @@ pub async fn dispatch(
             r.evidence.actor = context.actor.clone();
             r.evidence.bound_operation = bound_operation;
             r.evidence.risk = risk;
+            // Executors stamp `end_time` on their local evidence *after* they
+            // have already cloned it into the `ToolResult`, so a success would
+            // otherwise reach the sink with no end time — while a refusal,
+            // which dispatch stamps itself, always has one. An audit record
+            // that cannot be placed in a sequence is only half a record.
+            if r.evidence.end_time.is_none() {
+                r.evidence.end_time = Some(chrono::Utc::now());
+            }
             record = r.evidence.clone();
             Ok(r)
         }
@@ -1780,5 +1956,278 @@ mod tests {
             actor: None,
             approval_required: false,
         }
+    }
+
+    /// A context rooted at an explicit workspace, so a test can tell containment
+    /// against the workspace apart from containment against the process CWD.
+    fn context_in(dir: &Path) -> ToolContext {
+        ToolContext {
+            working_directory: dir.to_path_buf(),
+            environment: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            session_id: None,
+            actor: None,
+            approval_required: false,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TOOL-01: workspace containment and the `fs.read` byte bound
+    // -----------------------------------------------------------------------
+
+    /// The root of containment is the workspace, not wherever the process
+    /// happened to be started. Before containment existed, `fs.read` resolved
+    /// against `working_directory.join(path)` and a caller that bound a
+    /// different workspace still got CWD-relative behaviour out of
+    /// `DynamicTool`; this pins the substitution.
+    #[tokio::test]
+    async fn fs_read_resolves_against_the_workspace_not_the_process_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "from the workspace").unwrap();
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "probe.txt" }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect("the file exists inside the workspace");
+
+        assert!(result.success);
+        assert_eq!(
+            result.output["content"].as_str(),
+            Some("from the workspace")
+        );
+    }
+
+    /// A parent hop is refused on sight rather than normalised and re-tested.
+    #[tokio::test]
+    async fn fs_read_refuses_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().parent().unwrap().join("__tool01_never__.txt"),
+            "x",
+        )
+        .ok();
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let err = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "../__tool01_never__.txt" }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect_err("`..` must never be resolved");
+
+        let refused = err
+            .downcast_ref::<ToolError>()
+            .expect("containment refusals are typed");
+        assert!(
+            matches!(refused, ToolError::InvalidRequest { .. }),
+            "expected InvalidRequest, got {refused:?}"
+        );
+        assert!(refused.to_string().contains("`..`"), "{refused}");
+
+        let _ = std::fs::remove_file(dir.path().parent().unwrap().join("__tool01_never__.txt"));
+    }
+
+    /// An absolute path replaces the root during the join; containment must
+    /// still refuse it.
+    #[tokio::test]
+    async fn fs_read_refuses_an_absolute_path_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = if cfg!(windows) {
+            r"C:\Windows\win.ini"
+        } else {
+            "/etc/hostname"
+        };
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let err = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": outside }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect_err("an absolute path outside the workspace must be refused");
+
+        let refused = err.downcast_ref::<ToolError>().expect("typed refusal");
+        assert!(
+            refused.to_string().contains("outside the workspace"),
+            "{refused}"
+        );
+    }
+
+    /// `fs.write` carries the same containment as `fs.read`, and the refusal
+    /// has to happen before the file is created.
+    #[tokio::test]
+    async fn fs_write_refuses_parent_traversal_and_creates_nothing() {
+        let outer = tempfile::tempdir().unwrap();
+        let workspace = outer.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        let escape_target = outer.path().join("escaped.txt");
+
+        let tool = FileSystemTool::new("fs.write", "write");
+        let err = tool
+            .execute(
+                serde_json::json!({ "action": "write", "path": "../escaped.txt", "content": "x" }),
+                &context_in(&workspace),
+            )
+            .await
+            .expect_err("fs.write must not leave the workspace");
+
+        assert!(err.downcast_ref::<ToolError>().is_some(), "{err}");
+        assert!(
+            !escape_target.exists(),
+            "the refusing path must be checked before any I/O"
+        );
+    }
+
+    /// `fs.list` is a read of the directory tree, so it is contained too.
+    #[tokio::test]
+    async fn fs_list_refuses_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = FileSystemTool::new("fs.list", "list");
+        let err = tool
+            .execute(
+                serde_json::json!({ "action": "list", "path": ".." }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect_err("fs.list must not enumerate outside the workspace");
+        assert!(err.downcast_ref::<ToolError>().is_some(), "{err}");
+    }
+
+    /// A file one byte over the bound is refused outright. Truncating it and
+    /// returning `success` would be a success reported for a read that did not
+    /// happen in full.
+    #[tokio::test]
+    async fn fs_read_refuses_a_file_over_the_byte_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big.txt"),
+            vec![b'a'; FS_READ_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let err = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "big.txt" }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect_err("a file over the bound must be refused");
+
+        let refused = err.downcast_ref::<ToolError>().expect("typed refusal");
+        assert!(refused.to_string().contains("limit"), "{refused}");
+    }
+
+    /// The bound is inclusive: exactly [`FS_READ_MAX_BYTES`] bytes are read.
+    #[tokio::test]
+    async fn fs_read_accepts_a_file_exactly_at_the_byte_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("edge.txt"),
+            vec![b'a'; FS_READ_MAX_BYTES as usize],
+        )
+        .unwrap();
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "edge.txt" }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect("a file at the bound is within the bound");
+
+        assert!(result.success);
+        assert_eq!(result.output["size"].as_u64(), Some(FS_READ_MAX_BYTES));
+    }
+
+    /// A missing file is an ordinary I/O failure: `Ok` with `success: false`,
+    /// not a typed refusal and never a success.
+    #[tokio::test]
+    async fn fs_read_of_a_missing_file_reports_failure_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = FileSystemTool::new("fs.read", "read");
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "absent.txt" }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect("a missing file is a failed read, not an error path");
+
+        assert!(
+            !result.success,
+            "a failed read must not be reported as success"
+        );
+        assert_eq!(result.output["error_kind"].as_str(), Some("io"));
+    }
+
+    /// Bytes that are not UTF-8 have no string form to return, so the read
+    /// fails rather than producing lossy content labelled as the file.
+    #[tokio::test]
+    async fn fs_read_of_non_utf8_bytes_reports_failure_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("binary.bin"), [0x80u8, 0x81, 0x82, 0x41]).unwrap();
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "binary.bin" }),
+                &context_in(dir.path()),
+            )
+            .await
+            .expect("non-UTF-8 is a failed read, not an error path");
+
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"].as_str(), Some("non_utf8"));
+    }
+
+    /// A symlink inside the workspace pointing out of it is refused, because
+    /// containment compares canonical paths. Unix only: creating a symlink on
+    /// Windows requires privileges the test runner may not hold, and a test
+    /// that silently skips is not evidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_read_refuses_a_symlink_that_escapes_the_workspace() {
+        let outer = tempfile::tempdir().unwrap();
+        let workspace = outer.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        let secret = outer.path().join("secret.txt");
+        std::fs::write(&secret, "outside the workspace").unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.join("link.txt")).unwrap();
+
+        let tool = FileSystemTool::new("fs.read", "read");
+        let err = tool
+            .execute(
+                serde_json::json!({ "action": "read", "path": "link.txt" }),
+                &context_in(&workspace),
+            )
+            .await
+            .expect_err("a symlink out of the workspace must be refused");
+
+        let refused = err.downcast_ref::<ToolError>().expect("typed refusal");
+        assert!(
+            refused.to_string().contains("outside the workspace"),
+            "{refused}"
+        );
+    }
+
+    /// If the workspace itself cannot be resolved there is nothing to contain
+    /// against, and falling back to the CWD would silently retarget it.
+    #[test]
+    fn resolve_within_refuses_an_unresolvable_workspace_root() {
+        let err = resolve_within(
+            "fs.read",
+            Path::new("__zylcode_no_such_workspace_root__"),
+            "Cargo.toml",
+        )
+        .expect_err("an unresolvable root must not be silently replaced by the CWD");
+        assert!(matches!(err, ToolError::InvalidRequest { .. }), "{err:?}");
     }
 }

@@ -990,18 +990,18 @@ present an inference as a graph fact.",
                         // `execute_tool_call`).
                         let tool = self.tool_registry.get(&tool_id).await;
                         if let Some(tool) = tool {
-                            let tool_result = zylcode_mcp::with_actor(self.actor_id(), async {
-                                tool.call(arguments.clone()).await
-                            })
-                            .await;
+                            let tool_result = self.call_tool(tool, arguments.clone()).await;
 
                             match tool_result {
                                 Ok(result) => {
-                                    // Add tool result to session
-                                    self.add_tool_result(&tool_id, result.clone(), true, 0);
+                                    let ok = Self::tool_reported_success(&result);
 
-                                    // Update session context
-                                    if tool_id.starts_with("fs.") {
+                                    // Add tool result to session
+                                    self.add_tool_result(&tool_id, result.clone(), ok, 0);
+
+                                    // Update session context. Only a read that
+                                    // actually succeeded counts as read.
+                                    if ok && tool_id.starts_with("fs.") {
                                         if let Some(path) =
                                             arguments.get("path").and_then(|v| v.as_str())
                                         {
@@ -1015,7 +1015,7 @@ present an inference as a graph fact.",
                                     // Add observation
                                     let observation = ToolObservation {
                                         tool_id: tool_id.clone(),
-                                        success: true,
+                                        success: ok,
                                         stdout: result
                                             .get("stdout")
                                             .and_then(|v| v.as_str())
@@ -1310,17 +1310,17 @@ present an inference as a graph fact.",
                         // `execute_tool_call`).
                         let tool = self.tool_registry.get(&tool_id).await;
                         if let Some(tool) = tool {
-                            let tool_result = zylcode_mcp::with_actor(self.actor_id(), async {
-                                tool.call(arguments.clone()).await
-                            })
-                            .await;
+                            let tool_result = self.call_tool(tool, arguments.clone()).await;
 
                             match tool_result {
                                 Ok(result) => {
-                                    self.add_tool_result(&tool_id, result.clone(), true, 0);
-                                    self.add_system_message(
-                                        "Repair tool executed successfully".to_string(),
-                                    );
+                                    let ok = Self::tool_reported_success(&result);
+                                    self.add_tool_result(&tool_id, result.clone(), ok, 0);
+                                    self.add_system_message(if ok {
+                                        "Repair tool executed successfully".to_string()
+                                    } else {
+                                        format!("Repair tool reported a failure: {result}")
+                                    });
                                 }
                                 Err(e) => {
                                     self.add_tool_result(
@@ -1381,6 +1381,45 @@ present an inference as a graph fact.",
             tool_calls: None,
             tool_results: None,
         });
+    }
+
+    /// Did the tool report that it succeeded?
+    ///
+    /// The payload carries an explicit `success` out of
+    /// `zylcode_mcp::real_tools::dispatch`, through `DynamicTool::call`. Reading
+    /// it is the difference between recording what happened and recording that
+    /// *something* was attempted: these call sites previously passed `true`
+    /// unconditionally, so a refused or failed `fs.read` was stored in the
+    /// session as a **successful** tool result — a fabricated result, which
+    /// `docs/governance/TOOL_CATALOGUE_TRUTH_TABLE.md` §1.1 forbids.
+    ///
+    /// With the field absent the honest default is `false`: a failure reported
+    /// as a failure costs a retry, whereas success reported for work nobody
+    /// confirmed is a lie.
+    fn tool_reported_success(result: &serde_json::Value) -> bool {
+        result
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Run a registered tool under this loop's actor **and** workspace bindings.
+    ///
+    /// The workspace binding is what makes `fs.*` containment apply to *this
+    /// loop's* working directory rather than to whatever directory the process
+    /// happened to be started in — see `zylcode_mcp::workspace`. Without it,
+    /// `zylcode --workspace D:\other build` launched from anywhere else would
+    /// contain `fs.read` against the caller's shell directory.
+    async fn call_tool(
+        &self,
+        tool: Arc<dyn zylcode_mcp::Tool>,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let root = self.session.context.working_directory.clone();
+        zylcode_mcp::with_actor(self.actor_id(), async move {
+            zylcode_mcp::with_workspace_root(root, tool.call(params)).await
+        })
+        .await
     }
 
     fn add_tool_result(
@@ -1557,14 +1596,20 @@ present an inference as a graph fact.",
         // unidentified.
         let tool = self.tool_registry.get(&tool_call.tool_id).await;
         if let Some(tool) = tool {
-            let tool_result = zylcode_mcp::with_actor(self.actor_id(), async {
-                tool.call(tool_call.arguments.clone()).await
-            })
-            .await;
+            let tool_result = self.call_tool(tool, tool_call.arguments.clone()).await;
 
             match tool_result {
                 Ok(result) => {
-                    // Log to ledger: Executed
+                    let ok = Self::tool_reported_success(&result);
+
+                    // Log to ledger: Executed.
+                    //
+                    // `Executed` records that the executor *ran* — which it did,
+                    // whether or not the work inside it succeeded. The verdict
+                    // travels in the payload (`success`) and in the `Recorded`
+                    // observation below, so the chain stays truthful without
+                    // redefining what `Failed` means (it is the tool-error
+                    // path, not a completed-with-a-false-verdict path).
                     self.ledger
                         .update_state(
                             entry_id,
@@ -1575,10 +1620,12 @@ present an inference as a graph fact.",
                         .await?;
 
                     // Add tool result to session
-                    self.add_tool_result(&tool_call.tool_id, result.clone(), true, 0);
+                    self.add_tool_result(&tool_call.tool_id, result.clone(), ok, 0);
 
-                    // Update session context
-                    if tool_call.tool_id.starts_with("fs.") {
+                    // Update session context. A read that was refused — outside
+                    // the workspace, over the byte bound, or simply missing —
+                    // was not read, so it must not be recorded as if it were.
+                    if ok && tool_call.tool_id.starts_with("fs.") {
                         if let Some(path) = tool_call.arguments.get("path").and_then(|v| v.as_str())
                         {
                             self.session.context.files_read.push(PathBuf::from(path));
@@ -1588,7 +1635,7 @@ present an inference as a graph fact.",
                     // Add observation
                     let observation = ToolObservation {
                         tool_id: tool_call.tool_id.clone(),
-                        success: true,
+                        success: ok,
                         stdout: result
                             .get("stdout")
                             .and_then(|v| v.as_str())

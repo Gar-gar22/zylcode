@@ -18,6 +18,7 @@ pub mod skills_system;
 pub mod telemetry;
 pub mod tool;
 pub mod tool_catalogue;
+pub mod workspace;
 
 pub use actor::{current_actor, has_actor, with_actor};
 pub use audit::{AuditConfig, AuditEntry, AuditEventType, AuditLogger, AuditSeverity};
@@ -48,6 +49,7 @@ pub use skills_system::{SkillDefinition, SkillsSystem};
 pub use telemetry::{attrs, propagation, span_names, Telemetry, TelemetryConfig};
 pub use tool::{DynamicTool, Tool, ToolDescriptor};
 pub use tool_catalogue::{CapabilityStatus, Catalogue, CatalogueMetrics, EvidenceRung, ToolEntry};
+pub use workspace::{current_workspace_root, tool_working_directory, with_workspace_root};
 
 use anyhow::Result;
 use std::path::Path;
@@ -84,4 +86,60 @@ pub async fn register_from_default_location(registry: &ToolRegistry) -> usize {
             0
         }
     }
+}
+
+/// Register every catalogue-executable built-in that `registry` does not
+/// already carry. Returns the ids it added, in catalogue order.
+///
+/// # Why this exists
+///
+/// [`crate::registry::ToolRegistry`] starts empty, and it is the only table the
+/// agent loop consults (`AgentLoop::execute_tool_call`). A loop built over an
+/// empty registry therefore fails at its first tool step with
+/// `Tool not found: <id>` even though `get_real_tool` has a real executor for
+/// that id all along — the tool-name/dispatch mismatch recorded as **TOOL-01**
+/// in `docs/governance/REPOSITORY_INTELLIGENCE_WAVE_2026-09-28.md` §17.1. The
+/// desktop shell papers over this by loading `mcp.tools.yaml` at startup; the
+/// CLI never did, so `fs.read` — the id the plan template's own example step
+/// names — was unreachable from a real turn.
+///
+/// This is the configuration-independent counterpart to
+/// [`register_from_default_location`]:
+///
+/// * the source of truth is [`Catalogue::executable_ids`], so an id is
+///   registered **iff** `get_real_tool(id)` returns an executor — never a
+///   definition-only entry;
+/// * it does not depend on the process working directory, so it behaves the
+///   same from any directory and in any test;
+/// * each id becomes a [`DynamicTool`], whose `call` routes through
+///   [`crate::real_tools::dispatch`] — the `PermissionGate` and the evidence
+///   sink are therefore on the path, not bypassed.
+///
+/// It is fill-in only: an id already present (from `mcp.tools.yaml`, or from a
+/// previous call) is left exactly as it is, so a configured description and a
+/// caller-supplied [`DynamicTool::with_runtime`] are never clobbered. Calling
+/// it twice adds nothing the second time.
+pub async fn register_executable_builtins(registry: &ToolRegistry) -> Vec<String> {
+    let catalogue = Catalogue::canonical();
+
+    let mut registered = Vec::new();
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    for id in catalogue.executable_ids() {
+        if registry.get(id).await.is_some() {
+            continue;
+        }
+        let description = catalogue.get(id).map(|e| e.description.clone());
+        tools.push(Arc::new(DynamicTool::new(McpToolConfig {
+            id: id.to_string(),
+            command: "builtin".to_string(),
+            transport: McpTransport::Stdio,
+            env: Default::default(),
+            enabled: true,
+            description,
+        })));
+        registered.push(id.to_string());
+    }
+
+    registry.register_many(tools).await;
+    registered
 }
